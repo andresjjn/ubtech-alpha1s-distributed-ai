@@ -17,6 +17,7 @@ import glob
 import time
 import logging
 import select
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ class Alpha1SUSB:
     def __init__(self, path: str = None):
         self._path = path
         self._fd   = None
+        # Serializa el acceso a /dev/hidrawX: hasta 3 hilos escriben a la vez
+        # (heartbeat, gestos, refresh de bateria). Sin esto, dos write/read
+        # concurrentes entrelazan bytes -> frames HID corruptos.
+        self._lock = threading.Lock()
 
     # ── Conexión ──────────────────────────────────────────────────────────
 
@@ -79,8 +84,9 @@ class Alpha1SUSB:
         if not self._fd:
             raise RuntimeError("No conectado")
         report = payload + bytes(HID_REPORT_SIZE - len(payload))
-        self._fd.write(report)
-        return self._fd.read(HID_REPORT_SIZE)
+        with self._lock:
+            self._fd.write(report)
+            return self._fd.read(HID_REPORT_SIZE)
 
     def _send_with_retry(self, payload: bytes, cmd: int,
                          retries: int = 2, timeout: float = 0.3) -> bytes:
@@ -92,18 +98,19 @@ class Alpha1SUSB:
         if not self._fd:
             raise RuntimeError("No conectado")
         report = payload + bytes(HID_REPORT_SIZE - len(payload))
-        self._fd.write(report)
-        for attempt in range(retries + 1):
-            r, _, _ = select.select([self._fd], [], [], timeout)
-            if not r:
-                log.warning("_send_with_retry: timeout en intento %d (cmd=0x%02X)",
-                            attempt, cmd)
-                break
-            resp = self._fd.read(HID_REPORT_SIZE)
-            if cmd in resp:
-                return resp
-            log.debug("_send_with_retry: descartando paquete 0x%s (cmd=0x%02X no presente)",
-                      resp[:8].hex(), cmd)
+        with self._lock:
+            self._fd.write(report)
+            for attempt in range(retries + 1):
+                r, _, _ = select.select([self._fd], [], [], timeout)
+                if not r:
+                    log.warning("_send_with_retry: timeout en intento %d (cmd=0x%02X)",
+                                attempt, cmd)
+                    break
+                resp = self._fd.read(HID_REPORT_SIZE)
+                if cmd in resp:
+                    return resp
+                log.debug("_send_with_retry: descartando paquete 0x%s (cmd=0x%02X no presente)",
+                          resp[:8].hex(), cmd)
         # Si no encontramos la respuesta correcta, devolvemos bytes vacíos
         return bytes(HID_REPORT_SIZE)
 
@@ -111,7 +118,8 @@ class Alpha1SUSB:
         if not self._fd:
             raise RuntimeError("No conectado")
         report = payload + bytes(HID_REPORT_SIZE - len(payload))
-        self._fd.write(report)
+        with self._lock:
+            self._fd.write(report)
 
     # ── API pública ───────────────────────────────────────────────────────
 
