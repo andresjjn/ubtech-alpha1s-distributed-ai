@@ -48,6 +48,10 @@ import threading
 
 from alpha1s_usb import Alpha1SUSB
 from stream_parser import speak_stream   # Fase 4: turno por streaming SSE
+from choreographer import (              # Fase 1 v2: gestos continuos
+    build_playlist, load_gesture_durations, coverage as _gesture_coverage,
+)
+from behaviors import battery_policy, posture_ok   # Fase 3 v2: comportamientos
 
 # Cache de bateria: se lee en startup y se refresca en background.
 # El firmware del Alpha 1S no responde a 0x18 durante operacion activa.
@@ -69,11 +73,18 @@ WAKE_WORD = "alfa"
 CANCEL_WORDS = ("cancela", "cancelar", "detente", "alto")
 TEMP_AUDIO_FILENAME = "temp_recording.wav"
 
-SERVER_IP      = "192.168.1.7"
+SERVER_IP      = "192.168.1.6"
 SERVER_URL     = "http://" + SERVER_IP + ":3000/query"
 TRANSCRIBE_URL = "http://" + SERVER_IP + ":3000/transcribe"
 STREAM_URL     = "http://" + SERVER_IP + ":3000/query_stream"
 VISION_URL     = "http://" + SERVER_IP + ":3000/vision"   # V3: percepcion para misiones
+HEALTH_URL     = "http://" + SERVER_IP + ":3000/health"   # Fase 2: verificar contrato
+
+# Version del contrato que este cliente entiende. Se compara con /health.
+try:
+    from alpha1s_prompt import CONTRACT_VERSION as CLIENT_CONTRACT
+except Exception:
+    CLIENT_CONTRACT = "v3"
 
 # Fase 4: streaming SSE. False = flujo no-stream actual (intacto).
 # True = habla por frases y lanza gestos en paralelo. Probar en hardware.
@@ -97,6 +108,12 @@ METRICS_CSV_PATH = "metrics.csv"
 
 # Heartbeat USB: evita timeout de inactividad en el robot.
 USB_HEARTBEAT_INTERVAL = 8   # segundos
+
+# Fase 3: tras este tiempo sin interaccion, el robot entra en reposo
+# (postura init + LED apagado + frase breve). 0 o None lo desactiva.
+IDLE_REST_SECONDS = 300      # 5 minutos
+# Fase 3: no repetir el aviso de bateria mas de una vez cada X segundos.
+BATTERY_WARN_COOLDOWN = 120
 
 # ---------- SALUDO INICIAL ----------
 STARTUP_GREETING_TEXT = (
@@ -163,15 +180,21 @@ def _calc_rms(data_bytes):
 
 
 def _mark(stage):
-    """Wrapper seguro sobre metrics.mark(). No falla si metrics es None."""
+    """Wrapper seguro sobre metrics.mark(). Nunca bloquea la operacion."""
     if metrics is not None:
-        metrics.mark(stage)
+        try:
+            metrics.mark(stage)
+        except Exception:
+            pass
 
 
 def _set_meta(**kwargs):
-    """Wrapper seguro sobre metrics.set_meta()."""
+    """Wrapper seguro sobre metrics.set_meta(). Tolera campos nuevos."""
     if metrics is not None:
-        metrics.set_meta(**kwargs)
+        try:
+            metrics.set_meta(**kwargs)
+        except Exception:
+            pass
 
 
 # ---------- HEARTBEAT USB ----------
@@ -192,6 +215,52 @@ def _start_heartbeat(robot, stop_event):
     t = threading.Thread(target=_loop, daemon=True, name="usb-heartbeat")
     t.start()
     return t
+
+
+# ---------- FASE 3: LED EXPRESIVO POR ESTADO ----------
+class LedController:
+    """
+    Maquina de estados visible en el LED ocular. Un thread daemon aplica el
+    modo actual sin bloquear el flujo principal:
+      'off'   -> apagado (reposo)
+      'on'    -> fijo encendido (escuchando / hablando)
+      'blink' -> parpadeo lento (~1 Hz, "pensando": esperando al servidor)
+    Usa el lock HID interno del robot, asi que es seguro junto a gestos.
+    """
+    def __init__(self, robot, period=0.5):
+        self.robot   = robot
+        self.period  = period
+        self._mode   = "off"
+        self._stop   = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self.robot is None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="led-controller")
+        self._thread.start()
+
+    def set(self, mode):
+        self._mode = mode
+
+    def _loop(self):
+        on_now = None   # estado fisico actual del LED (None = desconocido)
+        while not self._stop.wait(self.period):
+            mode = self._mode
+            try:
+                if mode == "blink":
+                    on_now = not bool(on_now)
+                    self.robot.set_led(on_now)
+                elif mode == "on" and on_now is not True:
+                    self.robot.set_led(True); on_now = True
+                elif mode == "off" and on_now is not False:
+                    self.robot.set_led(False); on_now = False
+            except OSError:
+                pass   # USB caido: no tumbar el thread
+
+    def stop(self):
+        self._stop.set()
 
 
 # ---------- TTS ----------
@@ -215,6 +284,17 @@ def generate_tts_wav(text, voice_model_path, output_wav_path="response.wav"):
     except subprocess.CalledProcessError as e:
         print("[PI] Error ejecutando Piper: " + str(e))
         return None
+
+
+def wav_duration_s(wav_path):
+    """Duracion REAL de un WAV en segundos (frames / samplerate). 0.0 si falla."""
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / float(rate) if rate else 0.0
+    except Exception as e:
+        print("[PI] No pude medir duracion del WAV: " + str(e))
+        return 0.0
 
 
 def play_wav_file(wav_path):
@@ -256,43 +336,68 @@ def speak(text, voice_model_path):
 
 def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
     """
-    Reproduce el TTS y los gestos EN PARALELO.
+    Reproduce el TTS y gestos CONTINUOS en paralelo (Fase 1 v2).
+
+    Objetivo: mientras suene la voz, el robot SIEMPRE gesticula, y el tiempo
+    de movimiento iguala la duracion REAL del audio.
 
     Flujo:
-      1. Genera el WAV de Piper (bloqueante, ~50-500ms).
-      2. Lanza thread de gestos.
-      3. Reproduce el WAV en el thread principal.
-      4. Espera al thread de gestos con margen de gracia.
-      5. Vuelve a pose init para postura segura.
+      1. Genera el WAV de Piper y mide su duracion real (no se estima).
+      2. build_playlist() coreografia gestos que cubren esa duracion,
+         conservando la semilla semantica del LLM (apertura/desarrollo/cierre).
+      3. Thread de gestos: ejecuta la playlist; si el audio sigue sonando al
+         terminarla, sigue rellenando (bucle de garantia: nunca quieto).
+      4. Reproduce el WAV (bloqueante) en el thread principal.
+      5. Al terminar el audio: stop_event -> corte limpio por frame (<1s).
+      6. Vuelta suave a init para postura segura.
     """
-    if not gesture_sequence or robot is None:
+    if robot is None:
         speak(text, voice_model_path)
         return
-
-    print("[PI] Hablando con gestos: " + text)
-    print("[GESTURE] Secuencia: " + str(gesture_sequence))
 
     wav_path = generate_tts_wav(text, voice_model_path)
     if not wav_path:
         print("[PI] Fallo TTS. Cancelando gestos.")
         return
 
-    stop_event  = threading.Event()
-    usb_marked  = {"done": False}
+    audio_s  = wav_duration_s(wav_path)
+    playlist = build_playlist(gesture_sequence or [], audio_s, GESTURE_CATALOG)
+
+    print("[PI] Hablando con gestos: " + text)
+    print("[GESTURE] Audio: " + str(round(audio_s, 1)) + "s | semilla LLM: "
+          + str(gesture_sequence or []) + " | playlist: " + str(playlist))
+
+    if not playlist:
+        # Frase muy corta: hablar sin gestos (un gesto truncado se ve peor).
+        play_wav_file(wav_path)
+        return
+
+    stop_event = threading.Event()
+    usb_marked = {"done": False}
 
     def run_gestures():
-        for gesture_name in gesture_sequence:
-            if stop_event.is_set():
-                print("[GESTURE] Stop recibido, abortando secuencia.")
-                break
+        idx = 0
+        seq = list(playlist)
+        last = seq[-1] if seq else None
+        while not stop_event.is_set():
+            if idx >= len(seq):
+                # Audio aun suena y se acabo la playlist: rellenar para no
+                # quedar quieto. Pide un tramo mas al coreografo (2s extra).
+                extra = build_playlist([], 3.0, GESTURE_CATALOG)
+                extra = [g for g in extra if g != last] or extra
+                if not extra:
+                    break
+                seq.extend(extra)
+                last = seq[-1]
+            gesture_name = seq[idx]
+            idx += 1
             if gesture_name not in GESTURE_CATALOG:
-                print("[GESTURE] '" + gesture_name + "' no en catalogo. Saltando.")
                 continue
             try:
                 if not usb_marked["done"]:
                     _mark("t7_usb_command_sent")
                     usb_marked["done"] = True
-                play_gesture(gesture_name, robot)
+                play_gesture(gesture_name, robot, stop_event=stop_event)
             except Exception as e:
                 print("[GESTURE] Error en '" + gesture_name + "': " + str(e))
 
@@ -301,17 +406,18 @@ def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
 
     play_wav_file(wav_path)
 
-    gesture_thread.join(timeout=1.5)
+    # El audio termino: cortar los gestos de inmediato (por frame, <1s).
+    stop_event.set()
+    gesture_thread.join(timeout=2.0)
     if gesture_thread.is_alive():
-        print("[SYNC] Audio termino antes que los gestos. Senalando stop.")
-        stop_event.set()
-        gesture_thread.join(timeout=3.0)
-        if gesture_thread.is_alive():
-            print("[SYNC] Advertencia: thread de gestos no termino limpiamente.")
+        print("[SYNC] Advertencia: thread de gestos no termino limpiamente.")
 
-    # Volver a init para postura segura
+    cov = _gesture_coverage(playlist, audio_s, GESTURE_CATALOG)
+    _set_meta(gesture_coverage=round(cov, 3))
+
+    # Volver a init (suave) para postura segura
     try:
-        robot.set_all_servos(STATIC_POSES["init"], speed=50)
+        robot.set_all_servos(STATIC_POSES["init"], speed=30)
         sleep(0.5)
     except Exception as e:
         print("[GESTURE] Error volviendo a init: " + str(e))
@@ -376,7 +482,7 @@ def try_streaming_turn(user_text, voice_model, robot, battery_pct=None):
     _mark("t3_llm_response_received")
     _mark("t4_json_parsed")
 
-    if data.get("action"):
+    if data.get("action") and data.get("action") != "none":
         return ("action", data)
 
     # Conversacional: cerrar gestos y volver a init (postura segura)
@@ -413,19 +519,45 @@ def startup_greeting(robot, voice_model_path):
 
 
 # ---------- AUDIO ----------
-def listen_for_wake_word(recognizer, microphone):
+def listen_for_wake_word(recognizer, microphone, idle_cb=None, idle_after=None):
+    """
+    Espera la palabra de activacion. Devuelve True al detectarla.
+
+    Fase 3: si 'idle_after' (segundos) esta definido y pasa ese tiempo sin
+    NINGUNA voz, llama a idle_cb() UNA vez (rutina de reposo) y sigue
+    escuchando. Cualquier voz reinicia el temporizador de inactividad.
+    """
     print("\n[PI] Di '" + WAKE_WORD + "' para comenzar...")
     with microphone as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        idle_start = time.time()
+        idle_fired = False
         while True:
             try:
-                audio = recognizer.listen(source)
-                text  = recognizer.recognize_google(audio, language="es-ES").lower()
+                if idle_after:
+                    audio = recognizer.listen(source, timeout=8, phrase_time_limit=5)
+                else:
+                    audio = recognizer.listen(source)
+                text = recognizer.recognize_google(audio, language="es-ES").lower()
+                idle_start = time.time()   # hubo voz: reiniciar inactividad
+                idle_fired = False
                 if WAKE_WORD in text:
                     _mark("t0_wake_word_detected")
                     print("[PI] Palabra de activacion detectada.")
                     return True
+            except sr.WaitTimeoutError:
+                if (idle_after and not idle_fired
+                        and time.time() - idle_start >= idle_after):
+                    idle_fired = True
+                    if idle_cb:
+                        try:
+                            idle_cb()
+                        except Exception as e:
+                            print("[IDLE] Error en rutina de reposo: " + str(e))
+                continue
             except (sr.UnknownValueError, sr.RequestError):
+                idle_start = time.time()   # oyo algo (ruido/voz): resetear
+                idle_fired = False
                 continue
 
 
@@ -538,6 +670,36 @@ def _battery_refresh_loop(robot, stop_event):
             print("[BATTERY] Cache refrescada: " + str(pct) + "%")
 
 
+def check_server_health(voice_model=None):
+    """
+    Consulta /health y verifica que el servidor hable el mismo contrato.
+    Fase 2: evita el bug de despliegue asimetrico (Pi nuevo / ROG viejo o
+    viceversa). Devuelve True si todo cuadra o si no se pudo verificar
+    (no bloquea el arranque); avisa por voz si hay desajuste de contrato.
+    """
+    try:
+        r = requests.get(HEALTH_URL, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+    except requests.exceptions.RequestException as e:
+        print("[HEALTH] No pude verificar el servidor: " + str(e))
+        return True   # servidor viejo sin /health o inaccesible: no bloquear
+
+    server_contract = data.get("contract", "?")
+    print("[HEALTH] Servidor OK | contrato=" + str(server_contract)
+          + " modelo=" + str(data.get("model", "?"))
+          + " stt=" + str(data.get("stt", "?")))
+    if server_contract != CLIENT_CONTRACT:
+        msg = ("[HEALTH] DESAJUSTE DE CONTRATO: cliente=" + CLIENT_CONTRACT
+               + " servidor=" + str(server_contract))
+        print(msg)
+        if voice_model is not None:
+            speak("Atención: el servidor usa una versión distinta a la mía. "
+                  "Puede que algunas acciones no funcionen.", voice_model)
+        return False
+    return True
+
+
 def query_llm_server(text, battery_pct=None):
     """
     Envia el texto al ROG /query y retorna el JSON del LLM como string.
@@ -646,12 +808,45 @@ def play_sequence(sequence_name, robot, return_to_init=True):
     return "hecho"
 
 
-def play_gesture(gesture_name, robot):
+def _verify_posture(robot, expected=None, settle_s=0.4):
+    """
+    Fase 3: tras una secuencia, lee los angulos reales (opcode 0x25) y los
+    compara contra la pose esperada (init por defecto). Si difieren mucho,
+    intenta una vez volver a posicion_inicial. Best-effort: si el sensor no
+    responde (comun durante operacion), no hace nada.
+
+    Devuelve True si la postura es correcta o no se pudo verificar.
+    """
+    if robot is None:
+        return True
+    expected = expected if expected is not None else STATIC_POSES["init"]
+    try:
+        sleep(settle_s)   # dejar que los servos asienten antes de leer
+        measured = robot.read_all_angles()
+    except Exception as e:
+        print("[POSTURE] No pude leer angulos (0x25): " + str(e))
+        return True
+    if posture_ok(measured, expected):
+        return True
+    print("[POSTURE] Postura fuera de rango tras la secuencia. Reintentando init.")
+    try:
+        robot.set_all_servos(STATIC_POSES["init"], speed=40)
+        sleep(1.0)
+    except Exception as e:
+        print("[POSTURE] Error reintentando init: " + str(e))
+    return False
+
+
+def play_gesture(gesture_name, robot, stop_event=None):
     """
     Ejecuta un gesto corporal (archivo en gestures/).
     Usa _send_no_reply() para no esperar ACK en cada frame:
     gestos mas fluidos y sincronizados con el audio.
     NO vuelve a init al final — lo hace speak_with_gestures().
+
+    stop_event (Fase 1 v2): si se activa, el gesto se corta ENTRE frames
+    (<1s) en vez de esperar a terminar. Permite que los gestos paren en
+    cuanto el audio termina, sin dejar movimientos colgando.
     """
     file_path = os.path.join(GESTURES_DIR, gesture_name + ".txt")
     if not os.path.exists(file_path):
@@ -666,6 +861,8 @@ def play_gesture(gesture_name, robot):
 
     print("[GESTURE] Ejecutando '" + gesture_name + "' (" + str(len(frames)) + " frames)...")
     for frame in frames:
+        if stop_event is not None and stop_event.is_set():
+            break   # corte limpio por frame
         angles  = frame["angles"]
         time_ms = frame["time_ms"]
         speed   = max(1, int(time_ms / 20))
@@ -710,7 +907,7 @@ def _listen_for_cancel(cancel_event, stop_event):
 
 
 # ---------- DESPACHADOR ----------
-def handle_robot_action(action_json, robot):
+def handle_robot_action(action_json, robot, battery_pct=None):
     """
     Despacha la respuesta del LLM (JSON string).
 
@@ -720,6 +917,14 @@ def handle_robot_action(action_json, robot):
         action_data = json.loads(action_json)
         action_type = action_data.get("action")
         parameters  = action_data.get("parameters") or {}
+        # Contrato v2: "none" es el sentinela de "sin accion" y "target"
+        # reemplaza a parameters.{sequence_name,pose_name,state}.
+        # Se aceptan ambos formatos para compatibilidad.
+        if action_type in ("", "none"):
+            action_type = None
+        target = action_data.get("target")
+        if target in ("", "none"):
+            target = None
         _mark("t4_json_parsed")
         _set_meta(action_type=(action_type or "response"))
 
@@ -733,6 +938,22 @@ def handle_robot_action(action_json, robot):
                     print("[ROBOT] gesture_sequence no es lista, ignorando.")
                     gesture_sequence = None
                 else:
+                    # Red de seguridad: a veces el LLM mete un nombre de
+                    # SECUENCIA en gesture_sequence en vez de emitir
+                    # action=execute_sequence. Detectarlo y ejecutarla.
+                    seq_hits = [g for g in gesture_sequence
+                                if isinstance(g, str) and g in SEQUENCE_FILES]
+                    if seq_hits and robot is not None:
+                        seq_name = seq_hits[0]
+                        print("[ROBOT] Secuencia detectada en gesture_sequence, "
+                              "redirigiendo a execute_sequence: '" + seq_name + "'")
+                        keep_pose = (seq_name == "abrazar_objeto")
+                        result = play_sequence(seq_name, robot,
+                                               return_to_init=(not keep_pose))
+                        if isinstance(result, tuple):
+                            return None, None, result[1]
+                        return response_text, None, None
+
                     valid = [g for g in gesture_sequence
                              if isinstance(g, str) and g in GESTURE_CATALOG]
                     invalid = set(gesture_sequence) - set(valid)
@@ -740,23 +961,10 @@ def handle_robot_action(action_json, robot):
                         print("[ROBOT] Gestos invalidos descartados: " + str(invalid))
                     gesture_sequence = valid if valid else None
 
-            # Fallback: si el LLM omitio gesture_sequence y la respuesta tiene
-            # 4+ palabras, asignar gestos por defecto segun duracion estimada.
-            # Esto compensa que LM Studio no hace enforcement de required.
-            if gesture_sequence is None and response_text:
-                words = len(response_text.split())
-                if words >= 4:
-                    dur_s = words / 2.5
-                    if dur_s <= 3.5:
-                        gesture_sequence = ["enfatizar_breve"]
-                    elif dur_s <= 7.0:
-                        gesture_sequence = ["explicar_derecha", "afirmar"]
-                    else:
-                        gesture_sequence = ["explicar_derecha", "hablar_relajado",
-                                            "explicar_izquierda"]
-                    print("[ROBOT] gesture_sequence ausente — fallback por duracion "
-                          + str(round(dur_s, 1)) + "s: " + str(gesture_sequence))
-
+            # Nota: ya NO hay fallback por duracion aqui. speak_with_gestures()
+            # llama a build_playlist(), que coreografia gestos continuos a
+            # partir de la semilla del LLM (o desde cero si viene vacia) usando
+            # la duracion REAL del audio. La semilla puede ser None/[].
             _set_meta(
                 response_text=response_text or "",
                 gesture_count=len(gesture_sequence) if gesture_sequence else 0,
@@ -767,7 +975,7 @@ def handle_robot_action(action_json, robot):
         print("[ROBOT] Accion: " + str(action_type))
 
         if action_type == "execute_pose":
-            pose_name = parameters.get("pose_name")
+            pose_name = parameters.get("pose_name") or target
             if pose_name in STATIC_POSES:
                 _mark("t7_usb_command_sent")
                 robot.set_all_servos(STATIC_POSES[pose_name], speed=50)
@@ -778,22 +986,64 @@ def handle_robot_action(action_json, robot):
             return None, None, "Pose desconocida: '" + str(pose_name) + "'."
 
         if action_type == "execute_sequence":
-            sequence_name = parameters.get("sequence_name")
-            if sequence_name in SEQUENCE_FILES:
-                # abrazar_objeto termina sosteniendo el objeto: volver a INIT
-                # soltaria el cubo y violaria la Ley 2 (codo cerrado -> INIT).
-                # La salida segura es la secuencia soltar_objeto.
-                keep_pose = (sequence_name == "abrazar_objeto")
-                result = play_sequence(sequence_name, robot,
-                                       return_to_init=(not keep_pose))
-                if isinstance(result, tuple):
-                    return None, None, result[1]
-                resp = action_data.get("response") or None
-                return resp, None, None
-            return None, None, "Secuencia desconocida: '" + str(sequence_name) + "'."
+            # v3: "targets" (lista) encadena varias secuencias; si no viene,
+            # "target"/sequence_name ejecuta una sola (compatibilidad v2).
+            targets = action_data.get("targets")
+            seqs = ([t for t in targets if t in SEQUENCE_FILES]
+                    if isinstance(targets, list) else [])
+            single = parameters.get("sequence_name") or target
+            if not seqs and single in SEQUENCE_FILES:
+                seqs = [single]
+            if not seqs:
+                return None, None, ("Secuencia desconocida: '"
+                                    + str(single or targets) + "'.")
+
+            # Fase 3: si CUALQUIER paso es de alto consumo y la bateria esta
+            # baja, rechazar toda la cadena (evita brownout a mitad).
+            for s in seqs:
+                bpol, bmsg = battery_policy(battery_pct, s)
+                if bpol in ("reject", "rest"):
+                    print("[BATTERY] Cadena bloqueada por bateria en '" + s
+                          + "' (" + bpol + ").")
+                    return bmsg, None, None
+
+            # Cancelacion por voz solo tiene sentido en cadenas de 2+ pasos.
+            cancel_event  = threading.Event()
+            stop_listener = threading.Event()
+            if len(seqs) > 1:
+                print("[ROBOT] Cadena de " + str(len(seqs)) + " secuencias: "
+                      + str(seqs))
+                threading.Thread(
+                    target=_listen_for_cancel,
+                    args=(cancel_event, stop_listener),
+                    daemon=True,
+                ).start()
+
+            try:
+                for s in seqs:
+                    if cancel_event.is_set():
+                        robot.set_all_servos(STATIC_POSES["init"], speed=40)
+                        return "Secuencia cancelada.", None, None
+                    # abrazar_objeto termina sosteniendo el objeto: no volver a
+                    # INIT (soltaria el cubo, Ley 2). Salida segura: soltar_objeto.
+                    keep_pose = (s == "abrazar_objeto")
+                    result = play_sequence(s, robot,
+                                           return_to_init=(not keep_pose))
+                    if isinstance(result, tuple):
+                        return None, None, result[1]
+                    # Fase 3: verificar postura tras volver a init (opcode 0x25).
+                    if not keep_pose:
+                        _verify_posture(robot)
+            finally:
+                stop_listener.set()
+
+            resp = action_data.get("response") or None
+            return resp, None, None
 
         if action_type == "control_led":
-            state = parameters.get("state", False)
+            state = parameters.get("state")
+            if not isinstance(state, bool) and target in ("led_on", "led_off"):
+                state = (target == "led_on")
             if isinstance(state, bool):
                 print("[ROBOT] LEDs " + ("ON" if state else "OFF"))
                 _mark("t7_usb_command_sent")
@@ -808,7 +1058,7 @@ def handle_robot_action(action_json, robot):
         # y asegurarlo. Lazo cerrado: GET /vision -> primitiva -> re-percibir.
         # Cancelable por voz: di "cancela" / "alto" durante la mision.
         if action_type == "fetch_object":
-            target = parameters.get("target") or "aruco"
+            target = parameters.get("target") or target or "aruco"
             print("[MISSION] Objetivo: '" + target + "'")
             try:
                 from mission import FetchMission
@@ -882,9 +1132,14 @@ def handle_robot_action(action_json, robot):
 
 # ---------- MAIN ----------
 def main():
-    global metrics
+    global metrics, GESTURE_CATALOG
 
     print("Inicializando asistente de voz para Alpha 1S...")
+
+    # Fase 1 v2: calibrar las duraciones de gestos con el tiempo REAL de cada
+    # archivo. Las constantes hardcodeadas tenian hasta 1.5s de error.
+    GESTURE_CATALOG = load_gesture_durations(GESTURES_DIR, GESTURE_CATALOG)
+    print("[PI] Duraciones de gestos calibradas desde " + GESTURES_DIR + "/")
 
     if _METRICS_AVAILABLE:
         metrics = InteractionMetrics(csv_path=METRICS_CSV_PATH)
@@ -893,6 +1148,10 @@ def main():
         print("[PI] Corriendo SIN metricas.")
 
     voice_model     = initialize_piper_voice()
+
+    # Fase 2: verificar que el servidor hable el mismo contrato (v2).
+    check_server_health(voice_model)
+
     recognizer      = sr.Recognizer()
     microphone      = sr.Microphone(sample_rate=RATE, device_index=MIC_DEVICE_INDEX)
     audio_interface = pyaudio.PyAudio()
@@ -933,6 +1192,10 @@ def main():
         print("[ROBOT] No se pudo conectar: " + str(e))
         print("[ROBOT] Continuando SIN robot (solo voz).")
 
+    # Fase 3: LED expresivo por estado (thread daemon).
+    led = LedController(robot)
+    led.start()
+
     print("\n" + "=" * 50)
     print("Asistente Alpha 1S iniciado (transport: USB HID)")
     print("=" * 50)
@@ -940,15 +1203,36 @@ def main():
     startup_greeting(robot, voice_model)
     sleep(1.5)
 
+    # Fase 3: rutina de reposo por inactividad.
+    rest_state = {"resting": False, "last_batt_warn": 0.0}
+
+    def _idle_rest():
+        if rest_state["resting"]:
+            return
+        rest_state["resting"] = True
+        print("[IDLE] Sin interaccion; entrando en reposo.")
+        led.set("off")
+        if robot:
+            try:
+                robot.set_all_servos(STATIC_POSES["init"], speed=30)
+            except OSError:
+                pass
+
+    def _wake_from_rest():
+        if not rest_state["resting"]:
+            return
+        rest_state["resting"] = False
+        print("[IDLE] Despertando de reposo.")
+        startup_greeting(robot, voice_model)
+
     try:
         while True:
-            if listen_for_wake_word(recognizer, microphone):
+            if listen_for_wake_word(recognizer, microphone,
+                                    idle_cb=_idle_rest,
+                                    idle_after=IDLE_REST_SECONDS):
+                _wake_from_rest()
                 if robot:
-                    try:
-                        robot.set_led(True)
-                    except OSError as e:
-                        # USB del robot caido (cable): no tumbar el cliente
-                        print("[ROBOT] USB perdido en set_led: " + str(e))
+                    led.set("on")   # escuchando
                 stream.start_stream()
                 audio_frames = record_audio(stream)
                 stream.stop_stream()
@@ -971,6 +1255,19 @@ def main():
                     if battery_pct is not None:
                         print("[BATTERY] Nivel actual: " + str(battery_pct) + "%")
 
+                    # Fase 3: avisar de bateria baja/critica (con cooldown para
+                    # no repetirlo en cada turno).
+                    bpol, bmsg = battery_policy(battery_pct, None)
+                    if bpol in ("warn", "rest") and bmsg:
+                        now = time.time()
+                        if now - rest_state["last_batt_warn"] >= BATTERY_WARN_COOLDOWN:
+                            rest_state["last_batt_warn"] = now
+                            speak(bmsg, voice_model)
+
+                    # Fase 3: LED "pensando" mientras se procesa el turno.
+                    if robot:
+                        led.set("blink")
+
                     # --- FASE 4: intentar streaming (opt-in) ---
                     mode, sdata = ("fallback", None)
                     if USE_STREAMING and robot:
@@ -984,7 +1281,10 @@ def main():
 
                     elif mode == "action":
                         llm_str = json.dumps(sdata, ensure_ascii=False)
-                        rt, _gs, err = handle_robot_action(llm_str, robot)
+                        rt, _gs, err = handle_robot_action(llm_str, robot,
+                                                           battery_pct=battery_pct)
+                        if robot:
+                            led.set("on")
                         if err:
                             print("[ROBOT] ERROR: " + err)
                             _set_meta(error=err)
@@ -1004,7 +1304,7 @@ def main():
 
                             if robot:
                                 response_to_speak, gesture_sequence, error = handle_robot_action(
-                                    llm_output, robot
+                                    llm_output, robot, battery_pct=battery_pct
                                 )
                                 if error:
                                     print("[ROBOT] ERROR: " + error)
@@ -1020,8 +1320,14 @@ def main():
                                 except json.JSONDecodeError:
                                     response_to_speak = llm_output
 
+                            if robot:
+                                led.set("on")   # hablando
                             if response_to_speak:
-                                if gesture_sequence and robot:
+                                if robot:
+                                    # Siempre por speak_with_gestures: coreografia
+                                    # gestos continuos aunque la semilla venga
+                                    # vacia. Frases muy cortas no gesticulan
+                                    # (lo decide build_playlist por duracion).
                                     speak_with_gestures(
                                         response_to_speak, voice_model,
                                         gesture_sequence, robot
@@ -1032,10 +1338,7 @@ def main():
                     _set_meta(error="empty_transcription")
 
                 if robot:
-                    try:
-                        robot.set_led(False)
-                    except OSError as e:
-                        print("[ROBOT] USB perdido en set_led: " + str(e))
+                    led.set("off")   # turno terminado -> reposo visual
 
                 if metrics is not None:
                     metrics.commit()
@@ -1044,6 +1347,7 @@ def main():
         print("\n[PI] Apagando el asistente...")
     finally:
         hb_stop_event.set()   # detener heartbeat
+        led.stop()            # detener LED controller
         if stream.is_active():
             stream.stop_stream()
         stream.close()

@@ -43,31 +43,25 @@ class StreamingResponseParser:
         self.raw += delta
         out = []
 
-        # 1) Modo accion vs conversacional (una vez)
+        # 1) Extraer gesture_sequence en cuanto el array cierre. En el contrato
+        #    v2 va PRIMERO en el JSON, asi que se captura antes de clasificar.
+        self._maybe_capture_gestures()
+
+        # 2) Modo accion vs conversacional. Con el contrato v2 la clave
+        #    "action" SIEMPRE esta presente (antes de "response"), asi que
+        #    NO se puede clasificar por presencia/posicion: hay que leer su
+        #    VALOR. is_action = (valor != "none"). Compatible con v1 legacy
+        #    (sin clave "action" -> conversacional).
         if self.is_action is None:
-            has_action = '"action"' in self.raw
-            has_resp = '"response"' in self.raw
-            if has_action and not self._emitted:
-                if not has_resp or self.raw.index('"action"') < self.raw.index('"response"'):
-                    self.is_action = True
-            if self.is_action is None and has_resp:
-                self.is_action = False
+            val = self._action_value()
+            if val is not None:
+                self.is_action = (val != "none")
+            elif '"response"' in self.raw and '"action"' not in self.raw:
+                self.is_action = False   # v1 conversacional sin clave action
 
-        if self.is_action:
-            return out  # sin TTS incremental para acciones
-
-        # 2) Extraer gesture_sequence en cuanto el array este cerrado
-        if self.gestures is None and '"gesture_sequence"' in self.raw:
-            gk = self.raw.find('"gesture_sequence"')
-            lb = self.raw.find('[', gk)
-            if lb != -1:
-                rb = self.raw.find(']', lb)
-                if rb != -1:
-                    try:
-                        # gesture_sequence es lista plana de strings: primer ] cierra
-                        self.gestures = json.loads(self.raw[lb:rb + 1])
-                    except json.JSONDecodeError:
-                        pass
+        # Sin TTS incremental para acciones, ni hasta poder clasificar.
+        if self.is_action is None or self.is_action:
+            return out
 
         # 3) Localizar inicio del valor de "response"
         if not self.found_key:
@@ -111,6 +105,42 @@ class StreamingResponseParser:
                     self._emitted = True
                     self.sentence = []
         return out
+
+    def _maybe_capture_gestures(self):
+        """Extrae gesture_sequence en cuanto el array [..] este cerrado."""
+        if self.gestures is not None or '"gesture_sequence"' not in self.raw:
+            return
+        gk = self.raw.find('"gesture_sequence"')
+        lb = self.raw.find('[', gk)
+        if lb == -1:
+            return
+        rb = self.raw.find(']', lb)
+        if rb == -1:
+            return
+        try:
+            # gesture_sequence es lista plana de strings: el primer ] cierra
+            self.gestures = json.loads(self.raw[lb:rb + 1])
+        except json.JSONDecodeError:
+            pass
+
+    def _action_value(self):
+        """
+        Valor de la clave "action" si ya llego completo (comilla de cierre),
+        o None si aun no. Devuelve p.ej. "none", "execute_sequence".
+        """
+        k = self.raw.find('"action"')
+        if k == -1:
+            return None
+        colon = self.raw.find(':', k)
+        if colon == -1:
+            return None
+        q1 = self.raw.find('"', colon)
+        if q1 == -1:
+            return None
+        q2 = self.raw.find('"', q1 + 1)
+        if q2 == -1:
+            return None   # valor aun incompleto
+        return self.raw[q1 + 1:q2]
 
     @staticmethod
     def _unescape(c: str) -> str:

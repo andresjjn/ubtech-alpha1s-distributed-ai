@@ -32,7 +32,7 @@ from faster_whisper import WhisperModel
 
 from alpha1s_prompt import (
     LLM_API_BASE_URL, LLM_MODEL, LLM_PARAMS,
-    ALPHA1S_SCHEMA, LLM_SYSTEM_PROMPT,
+    ALPHA1S_SCHEMA, LLM_SYSTEM_PROMPT, CONTRACT_VERSION,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -57,32 +57,41 @@ log.info("faster-whisper listo.")
 def _build_messages(prompt_text: str, battery_pct=None):
     """
     Construye el array de mensajes para el LLM.
-    Si battery_pct esta disponible lo inyecta como nota de sistema
-    separada para no contaminar el prompt principal.
-    El LLM la usa solo si el usuario pregunta por la bateria.
+
+    La nota de batería se FUSIONA al final del único system prompt.
+    ⚠️  NO añadirla como segundo mensaje system: los tests A/B (Jul 2026)
+    mostraron que un system extra tras el prompt principal hace que el
+    modelo deje de emitir "action" en comandos físicos (0/6 vs 3/6).
     """
-    messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}]
     if battery_pct is not None:
-        messages.append({
-            "role": "system",
-            "content": (
-                "[DATO CONTEXTUAL — no menciones esto a menos que el usuario "
-                "pregunte por la batería] "
-                f"La batería del robot está al {battery_pct}%."
-            ),
-        })
+        battery_note = (
+            "\n\n[DATO CONTEXTUAL — no lo menciones a menos que el usuario "
+            f"pregunte por la batería] La batería del robot está al {battery_pct}%."
+        )
     else:
-        messages.append({
-            "role": "system",
-            "content": (
-                "[DATO CONTEXTUAL] No se dispone del nivel de batería en este momento. "
-                "Si el usuario pregunta por la batería, responde exactamente: "
-                "'No tengo acceso al sensor de batería en este momento.' "
-                "NUNCA inventes un porcentaje."
-            ),
-        })
-    messages.append({"role": "user", "content": prompt_text})
-    return messages
+        battery_note = (
+            "\n\n[DATO CONTEXTUAL] No se dispone del nivel de batería en este "
+            "momento. Si el usuario pregunta por la batería, responde "
+            "exactamente: 'No tengo acceso al sensor de batería en este "
+            "momento.' NUNCA inventes un porcentaje."
+        )
+    return [
+        {"role": "system", "content": LLM_SYSTEM_PROMPT + battery_note},
+        {"role": "user", "content": prompt_text},
+    ]
+
+
+# ── /health ───────────────────────────────────────────────────────────────────
+# El cliente lo consulta en startup para verificar que Pi y ROG hablan el
+# mismo contrato (evita el bug de despliegue asimetrico que ya ocurrio).
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status":   "ok",
+        "contract": CONTRACT_VERSION,
+        "model":    LLM_MODEL,
+        "stt":      STT_MODEL,
+    })
 
 
 # ── /transcribe ───────────────────────────────────────────────────────────────
@@ -202,7 +211,8 @@ if __name__ == '__main__':
     print("  Alpha 1S — ROG Server  [Fase 4]")
     print(f"  Modelo  : {LLM_MODEL}")
     print("  Puerto  : http://0.0.0.0:3000")
-    print("  Endpoints: /query  /query_stream  /transcribe")
+    print(f"  Contrato: {CONTRACT_VERSION}")
+    print("  Endpoints: /health  /query  /query_stream  /transcribe")
     print("=" * 55)
     # threaded=True: SSE mantiene la conexión abierta; sin esto, /transcribe
     # u otra query concurrente bloquearía.
