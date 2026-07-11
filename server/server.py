@@ -57,32 +57,28 @@ log.info("faster-whisper listo.")
 def _build_messages(prompt_text: str, battery_pct=None):
     """
     Construye el array de mensajes para el LLM.
-    Si battery_pct esta disponible lo inyecta como nota de sistema
-    separada para no contaminar el prompt principal.
-    El LLM la usa solo si el usuario pregunta por la bateria.
+
+    La nota de batería se FUSIONA al final del único system prompt.
+    ⚠️  NO añadirla como segundo mensaje system: los tests A/B (Jul 2026)
+    mostraron que un system extra tras el prompt principal hace que el
+    modelo deje de emitir "action" en comandos físicos (0/6 vs 3/6).
     """
-    messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}]
     if battery_pct is not None:
-        messages.append({
-            "role": "system",
-            "content": (
-                "[DATO CONTEXTUAL — no menciones esto a menos que el usuario "
-                "pregunte por la batería] "
-                f"La batería del robot está al {battery_pct}%."
-            ),
-        })
+        battery_note = (
+            "\n\n[DATO CONTEXTUAL — no lo menciones a menos que el usuario "
+            f"pregunte por la batería] La batería del robot está al {battery_pct}%."
+        )
     else:
-        messages.append({
-            "role": "system",
-            "content": (
-                "[DATO CONTEXTUAL] No se dispone del nivel de batería en este momento. "
-                "Si el usuario pregunta por la batería, responde exactamente: "
-                "'No tengo acceso al sensor de batería en este momento.' "
-                "NUNCA inventes un porcentaje."
-            ),
-        })
-    messages.append({"role": "user", "content": prompt_text})
-    return messages
+        battery_note = (
+            "\n\n[DATO CONTEXTUAL] No se dispone del nivel de batería en este "
+            "momento. Si el usuario pregunta por la batería, responde "
+            "exactamente: 'No tengo acceso al sensor de batería en este "
+            "momento.' NUNCA inventes un porcentaje."
+        )
+    return [
+        {"role": "system", "content": LLM_SYSTEM_PROMPT + battery_note},
+        {"role": "user", "content": prompt_text},
+    ]
 
 
 # ── /transcribe ───────────────────────────────────────────────────────────────
