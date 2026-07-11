@@ -106,10 +106,13 @@ The only network segment in the voice loop is the one-way TTS output ROG → Pi.
 ```
 Alpha1s_modernization/
 ├── client/                         # Raspberry Pi — audio playback + robot control
-│   ├── raspberry_client_gestos.py  # Main client (Phase 4, active version)
-│   ├── alpha1s_usb.py              # USB HID transport driver
-│   ├── stream_parser.py            # SSE streaming parser (Phase 4)
-│   ├── metrics.py                  # Latency logger t0–t7 → CSV
+│   ├── client.py                   # Main client (v2)
+│   ├── choreographer.py            # v2: coreografía de gestos continuos (núcleo puro)
+│   ├── behaviors.py                # v2: política de batería + chequeo de postura (puro)
+│   ├── alpha1s_usb.py              # USB HID transport driver (con lock, v2)
+│   ├── stream_parser.py            # SSE streaming parser (arreglado para v3)
+│   ├── alpha1s_prompt.py           # Copia sincronizada del prompt (import CONTRACT_VERSION)
+│   ├── mission.py                  # V3: misión de servovisión (fetch_object)
 │   ├── es_MX-claude-high.onnx      # Piper TTS voice model (Spanish)
 │   ├── sequences/                  # Full-body movement files (12 files)
 │   │   ├── mover_adelante.txt
@@ -124,24 +127,20 @@ Alpha1s_modernization/
 │   │   ├── posicion_inicial.txt
 │   │   ├── levantarse_desde_el_frente.txt
 │   │   └── levantarse_desde_la_espalda.txt
-│   └── gestures/                   # Arm-only gesture files (12 files, run parallel to TTS)
-│       ├── saludar.txt
-│       ├── despedirse.txt
-│       ├── presentarse.txt
-│       ├── brazos_abiertos_bienvenida.txt
-│       ├── pensar.txt
-│       ├── afirmar.txt
-│       ├── enfatizar_breve.txt
-│       ├── senalar_adelante.txt
-│       ├── explicar_derecha.txt
-│       ├── explicar_izquierda.txt
-│       ├── explicar_ambos.txt
-│       └── hablar_relajado.txt
+│   └── gestures/                   # Arm-only gesture files (run parallel to TTS)
+│       ├── saludar.txt  · despedirse.txt · presentarse.txt · reverencia.txt
+│       ├── brazos_abiertos_bienvenida.txt · pensar.txt · afirmar.txt
+│       ├── enfatizar_breve.txt · senalar_adelante.txt · saludo_inicial.txt
+│       └── explicar_derecha.txt · explicar_izquierda.txt · explicar_ambos.txt · hablar_relajado.txt
 │
 ├── server/                         # ROG Ally X — LLM + STT + TTS + Flask
-│   ├── rog_server_fase4.py         # Flask :3000 — /query + /query_stream + /transcribe
-│   ├── alpha1s_prompt.py           # System prompt + JSON schema (single source of truth)
+│   ├── server.py                   # Flask :3000 — /health + /query + /query_stream + /transcribe
+│   ├── alpha1s_prompt.py           # System prompt + JSON schema v3 (single source of truth)
 │   └── benchmark.py                # Phase 6: TTFT / tok/s / valid JSON / gestures per model
+│
+├── tests/                          # v2: 29 tests sin hardware (choreographer, behaviors, …)
+├── deploy_pi.sh                    # v2: rsync del cliente a la Pi (dry-run por defecto)
+├── PLAN_GESTOS_CONTINUOS.md        # v2: plan de ejecución (3 fases)
 │
 ├── simulation/                     # ROS2 + Gazebo work (ABANDONED — kept as reference)
 │   └── alpha1s_bringup/
@@ -230,11 +229,7 @@ python rog_server_fase4.py
 
 ### Client (Raspberry Pi)
 
-1. Update `ROG_SERVER_URL` in `raspberry_client_gestos.py`:
-
-```python
-ROG_SERVER_URL = "http://<ROG_LAN_IP>:3000"
-```
+1. Set `SERVER_IP` in `client/client.py` to the ROG's LAN IP.
 
 2. Connect the robot via USB to a **blue port** (Bus 002 or Bus 004) on the Pi.
 
@@ -245,10 +240,21 @@ ROG_SERVER_URL = "http://<ROG_LAN_IP>:3000"
 ```bash
 cd client/
 source ~/TDD/venv/bin/activate
-python raspberry_client_gestos.py
+python client.py
 ```
 
 5. Say **"alfa"** to trigger the wake word, then speak your command.
+
+#### Deploy desde el repo (v2)
+
+Desde una máquina de desarrollo, sincroniza el cliente a la Pi con el script incluido (rsync con dry-run por defecto):
+
+```bash
+./deploy_pi.sh            # DRY-RUN: muestra qué cambiaría, no toca nada
+./deploy_pi.sh --apply    # aplica (pide confirmación)
+```
+
+Variables: `PI_HOST` (def. `ros@192.168.1.16`), `PI_DIR` (def. `/home/ros/TDD`), `PI_KEY` (def. `~/.ssh/id_rpi`). **El servidor (ROG, Windows sin SSH) se copia a mano**: `server/alpha1s_prompt.py` + `server/server.py`, y reiniciar Flask. El cliente verifica el contrato contra `/health` al arrancar y avisa por voz si Pi y ROG no coinciden.
 
 ---
 
@@ -275,63 +281,49 @@ All endpoints are served by `rog_server_fase4.py` on port `3000`.
 
 ---
 
-## JSON Contract
+## JSON Contract (v3)
 
-`gesture_sequence` is **always present and always first**. Keys and action types are in English; `response` text is in Spanish.
+> **Contrato v3 (v2, julio 2026).** El JSON tiene **siempre las 5 claves**, todas `required` en el schema, en este orden: `gesture_sequence`, `action`, `target`, `targets`, `response`. Los valores `"none"` y `[]` son los sentinelas de *sin acción* / *sin encadenar*.
+>
+> **Por qué todas requeridas:** LM Studio (gramática de llama.cpp) **omite las propiedades opcionales** del schema con mucha frecuencia — el modelo dejaba de emitir `action` en comandos físicos. Con toda clave en `required`, la gramática escribe la clave y el modelo solo elige el valor del enum. Esto reemplazó al contrato v1 (objeto anidado `parameters`, que sufría el mismo problema).
 
 ### Type 1 — Conversational (with gestures)
 
 ```json
-{
-  "gesture_sequence": ["saludar", "presentarse"],
-  "response": "Hola, soy Alpha 1S. ¿En qué puedo ayudarte?"
-}
+{"gesture_sequence": ["saludar", "presentarse"], "action": "none", "target": "none", "targets": [], "response": "Hola, soy Alpha 1S. ¿En qué puedo ayudarte?"}
 ```
 
-### Type 2 — Static pose
+### Type 2 — Static pose  (`target`: `init`, `hands_up`)
 
 ```json
-{
-  "gesture_sequence": [],
-  "action": "execute_pose",
-  "parameters": {"pose_name": "hands_up"},
-  "response": "Levantando los brazos."
-}
+{"gesture_sequence": [], "action": "execute_pose", "target": "hands_up", "targets": [], "response": "Levantando los brazos."}
 ```
-
-Available poses: `init`, `hands_up`
 
 ### Type 3 — Movement sequence
 
 ```json
-{
-  "gesture_sequence": [],
-  "action": "execute_sequence",
-  "parameters": {"sequence_name": "mover_adelante"},
-  "response": "Caminando hacia adelante."
-}
+{"gesture_sequence": [], "action": "execute_sequence", "target": "mover_adelante", "targets": [], "response": "Caminando hacia adelante."}
 ```
 
-### Type 4 — LED control
+### Type 3b — Chained sequences (v3)
+
+Para varias secuencias en orden (*"camina y luego gira"*), `target` queda en `"none"` y `targets` lleva la lista:
 
 ```json
-{
-  "gesture_sequence": [],
-  "action": "control_led",
-  "parameters": {"state": true},
-  "response": "Encendiendo luces."
-}
+{"gesture_sequence": [], "action": "execute_sequence", "target": "none", "targets": ["mover_adelante", "girar_a_la_derecha"], "response": "Camino y luego giro."}
 ```
 
-### Gesture fallback (client-side)
+El cliente ejecuta la cadena en orden, verifica la postura entre pasos, y admite cancelación por voz (`cancela`, `alto`).
 
-If `gesture_sequence` is absent or empty and `response` has ≥ 4 words, the client selects a fallback gesture based on speech duration:
+### Type 4 — LED control  (`target`: `led_on`, `led_off`)
 
-| Estimated duration | Fallback gesture(s) |
-|---|---|
-| ≤ 3.5 s | `enfatizar_breve` |
-| 3.5 – 7 s | `explicar_derecha`, `afirmar` |
-| > 7 s | `explicar_derecha`, `hablar_relajado`, `explicar_izquierda` |
+```json
+{"gesture_sequence": [], "action": "control_led", "target": "led_on", "targets": [], "response": "Encendiendo luces."}
+```
+
+### Gestos continuos (client-side, v2)
+
+Ya **no** hay un fallback por estimación de palabras. El cliente mide la **duración real** del WAV de Piper y `choreographer.build_playlist()` coreografía gestos que cubren todo el habla (conservando la semilla del LLM como apertura/desarrollo/cierre, rellenando huecos, cortando por frame al terminar la voz). Ver [`client/choreographer.py`](client/choreographer.py) y [`PLAN_GESTOS_CONTINUOS.md`](PLAN_GESTOS_CONTINUOS.md).
 
 ### Qwen language leak mitigation
 
@@ -386,7 +378,7 @@ Servo IDs `0–15` (robot firmware uses `1–16` — `alpha1s_usb.py` handles th
 
 ## Gesture Catalog
 
-Gestures move only arm servos (IDs 0–5). They run in a daemon thread parallel to TTS playback. Files live in `client/gestures/`.
+Gestures move only arm servos (IDs 0–5). They run in a daemon thread parallel to TTS playback. Files live in `client/gestures/`. **v2:** las duraciones se **calibran en startup** desde el tiempo real de cada frame (`choreographer.load_gesture_durations`); los valores abajo son nominales. `reverencia` fue añadida al catálogo del LLM en v2.
 
 | Name | Duration |
 |---|---|
@@ -402,6 +394,7 @@ Gestures move only arm servos (IDs 0–5). They run in a daemon thread parallel 
 | `brazos_abiertos_bienvenida` | 4.0 s |
 | `explicar_ambos` | 5.3 s |
 | `hablar_relajado` | 5.4 s |
+| `reverencia` | 5.0 s |
 
 ---
 
@@ -459,20 +452,36 @@ Responses start directly with `FB BF` — no HID report ID prefix.
 
 ---
 
+## What's New in v2 (Post-Thesis)
+
+Rama `v2` → tag `v2.0`. Plan completo: [`PLAN_GESTOS_CONTINUOS.md`](PLAN_GESTOS_CONTINUOS.md).
+
+**Fix del contrato (v1 → v3):**
+- **Secuencias físicas fiables.** El LLM omitía `action` (comandos como *"levántate desde la espalda"* se ejecutaban como charla). Causa: LM Studio omite propiedades **opcionales** del schema. Solución: contrato con **todas las claves requeridas** + sentinelas. Validado 30/30 en vivo.
+
+**Fase 1 — Gestos continuos:** el robot gesticula **durante todo el habla**, igualando la duración **real** del audio (medida del WAV, no estimada). Coreógrafo puro ([`choreographer.py`](client/choreographer.py)) + corte por frame. Duraciones **calibradas** desde los archivos.
+
+**Fase 2 — Robustez:** arreglo del `stream_parser` para el contrato v3; `saludo_inicial` movido a `gestures/`; `reverencia` expuesta al LLM; **lock HID** (3 hilos concurrentes); endpoint **`/health`** + verificación de contrato en el cliente; script **`deploy_pi.sh`**.
+
+**Fase 3 — Funcionalidades:** **LED expresivo** por estado (escuchando/pensando/hablando/reposo); **chequeo de postura** tras secuencias (opcode `0x25`); **política de batería** (avisa <20%, rechaza alto consumo, reposo <10%); **modo cuentacuentos**; **reposo por inactividad**; **encadenamiento de comandos** (*"camina y luego gira"*, contrato v3).
+
+**Pruebas:** 29 tests automáticos sin hardware (choreographer, stream_parser, behaviors, chaining, integración) + validación en vivo contra LM Studio en cada cambio de prompt.
+
+---
+
 ## Known Issues
 
 | # | Issue | Where | Priority |
 |---|---|---|---|
-| 1 | Wake word and VAD still run on the Pi (legacy flow) | `raspberry_client_gestos.py` | 🔴 Pending migration to ROG |
-| 2 | TTS still synthesized on Pi (legacy flow) | `raspberry_client_gestos.py` | 🔴 Pending migration to ROG |
-| 3 | `legacy_dance` system (`htsparser` + `pygame`) not yet removed | client | 🟡 Isolate or delete |
-| 4 | `ROG_SERVER_URL` hardcoded — no env var / config file | client | 🟡 |
-| 5 | Streaming SSE (`/query_stream`) code complete but not hardware-tested | server + client | 🟡 |
+| 1 | Wake word and VAD still run on the Pi (legacy flow) | `client/client.py` | 🔴 Pending migration to ROG |
+| 2 | TTS still synthesized on Pi (legacy flow) | `client/client.py` | 🔴 Pending migration to ROG |
+| 5 | Streaming SSE (`/query_stream`) parser fixed for v3 but not hardware-tested | server + client | 🟡 `USE_STREAMING=False` |
 | 6 | Phase 6 benchmark (`benchmark.py`) not yet run | server | 🟡 Required for thesis |
 | 7 | Battery telemetry (`0x18`) semantics undefined with external PSU | `alpha1s_usb.py` | 🟡 Re-measure |
-| 8 | `reverencia` mapped in `SEQUENCE_FILES` as `sequences/` but file lives in `gestures/` | client | 🟠 |
 | 9 | Qwen2.5-7B CJK language leak under long responses | server | 🟠 Mitigation in place |
 | 10 | CoM shifted up/forward after battery removal → worse gait stability | hardware | ⚪ Addressed in Phase B |
+
+**Resuelto en v2:** contrato JSON (acciones fiables), gestos continuos + calibración, bug del `stream_parser` con v3, drift `saludo_inicial` (`sequences/` → `gestures/`), acceso HID concurrente sin lock, `ROG_SERVER_URL` hardcodeado (ahora `SERVER_IP` + `/health`).
 
 ---
 
@@ -506,7 +515,8 @@ The URDF, STL meshes, and inertia data are preserved and will be reused for arm 
 
 | Axis | Status |
 |---|---|
-| Cognitive (voice + LLM + gestures) | ✅ **Frozen — thesis final deliverable** |
+| Cognitive (voice + LLM + gestures) — thesis | ✅ **Frozen — thesis final deliverable** (tag `v1.0`) |
+| **v2 (post-thesis): gestos continuos + robustez + nuevas features** | ✅ **Completa** (tag `v2.0`, contrato v3, 29 tests) |
 | Simulation / RL | ❌ **Abandoned** (URDF/STL assets preserved) |
 | Advanced robotics (Phases A–F) | 🔭 **Post-thesis — Phase A is next** |
 
