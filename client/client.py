@@ -69,7 +69,7 @@ WAKE_WORD = "alfa"
 CANCEL_WORDS = ("cancela", "cancelar", "detente", "alto")
 TEMP_AUDIO_FILENAME = "temp_recording.wav"
 
-SERVER_IP      = "192.168.1.7"
+SERVER_IP      = "192.168.1.6"
 SERVER_URL     = "http://" + SERVER_IP + ":3000/query"
 TRANSCRIBE_URL = "http://" + SERVER_IP + ":3000/transcribe"
 STREAM_URL     = "http://" + SERVER_IP + ":3000/query_stream"
@@ -376,7 +376,7 @@ def try_streaming_turn(user_text, voice_model, robot, battery_pct=None):
     _mark("t3_llm_response_received")
     _mark("t4_json_parsed")
 
-    if data.get("action"):
+    if data.get("action") and data.get("action") != "none":
         return ("action", data)
 
     # Conversacional: cerrar gestos y volver a init (postura segura)
@@ -720,6 +720,14 @@ def handle_robot_action(action_json, robot):
         action_data = json.loads(action_json)
         action_type = action_data.get("action")
         parameters  = action_data.get("parameters") or {}
+        # Contrato v2: "none" es el sentinela de "sin accion" y "target"
+        # reemplaza a parameters.{sequence_name,pose_name,state}.
+        # Se aceptan ambos formatos para compatibilidad.
+        if action_type in ("", "none"):
+            action_type = None
+        target = action_data.get("target")
+        if target in ("", "none"):
+            target = None
         _mark("t4_json_parsed")
         _set_meta(action_type=(action_type or "response"))
 
@@ -733,6 +741,22 @@ def handle_robot_action(action_json, robot):
                     print("[ROBOT] gesture_sequence no es lista, ignorando.")
                     gesture_sequence = None
                 else:
+                    # Red de seguridad: a veces el LLM mete un nombre de
+                    # SECUENCIA en gesture_sequence en vez de emitir
+                    # action=execute_sequence. Detectarlo y ejecutarla.
+                    seq_hits = [g for g in gesture_sequence
+                                if isinstance(g, str) and g in SEQUENCE_FILES]
+                    if seq_hits and robot is not None:
+                        seq_name = seq_hits[0]
+                        print("[ROBOT] Secuencia detectada en gesture_sequence, "
+                              "redirigiendo a execute_sequence: '" + seq_name + "'")
+                        keep_pose = (seq_name == "abrazar_objeto")
+                        result = play_sequence(seq_name, robot,
+                                               return_to_init=(not keep_pose))
+                        if isinstance(result, tuple):
+                            return None, None, result[1]
+                        return response_text, None, None
+
                     valid = [g for g in gesture_sequence
                              if isinstance(g, str) and g in GESTURE_CATALOG]
                     invalid = set(gesture_sequence) - set(valid)
@@ -740,9 +764,9 @@ def handle_robot_action(action_json, robot):
                         print("[ROBOT] Gestos invalidos descartados: " + str(invalid))
                     gesture_sequence = valid if valid else None
 
-            # Fallback: si el LLM omitio gesture_sequence y la respuesta tiene
-            # 4+ palabras, asignar gestos por defecto segun duracion estimada.
-            # Esto compensa que LM Studio no hace enforcement de required.
+            # Fallback: si el LLM dejo gesture_sequence vacia (o todos sus
+            # gestos fueron descartados) y la respuesta tiene 4+ palabras,
+            # asignar gestos por defecto segun duracion estimada.
             if gesture_sequence is None and response_text:
                 words = len(response_text.split())
                 if words >= 4:
@@ -767,7 +791,7 @@ def handle_robot_action(action_json, robot):
         print("[ROBOT] Accion: " + str(action_type))
 
         if action_type == "execute_pose":
-            pose_name = parameters.get("pose_name")
+            pose_name = parameters.get("pose_name") or target
             if pose_name in STATIC_POSES:
                 _mark("t7_usb_command_sent")
                 robot.set_all_servos(STATIC_POSES[pose_name], speed=50)
@@ -778,7 +802,7 @@ def handle_robot_action(action_json, robot):
             return None, None, "Pose desconocida: '" + str(pose_name) + "'."
 
         if action_type == "execute_sequence":
-            sequence_name = parameters.get("sequence_name")
+            sequence_name = parameters.get("sequence_name") or target
             if sequence_name in SEQUENCE_FILES:
                 # abrazar_objeto termina sosteniendo el objeto: volver a INIT
                 # soltaria el cubo y violaria la Ley 2 (codo cerrado -> INIT).
@@ -793,7 +817,9 @@ def handle_robot_action(action_json, robot):
             return None, None, "Secuencia desconocida: '" + str(sequence_name) + "'."
 
         if action_type == "control_led":
-            state = parameters.get("state", False)
+            state = parameters.get("state")
+            if not isinstance(state, bool) and target in ("led_on", "led_off"):
+                state = (target == "led_on")
             if isinstance(state, bool):
                 print("[ROBOT] LEDs " + ("ON" if state else "OFF"))
                 _mark("t7_usb_command_sent")
@@ -808,7 +834,7 @@ def handle_robot_action(action_json, robot):
         # y asegurarlo. Lazo cerrado: GET /vision -> primitiva -> re-percibir.
         # Cancelable por voz: di "cancela" / "alto" durante la mision.
         if action_type == "fetch_object":
-            target = parameters.get("target") or "aruco"
+            target = parameters.get("target") or target or "aruco"
             print("[MISSION] Objetivo: '" + target + "'")
             try:
                 from mission import FetchMission
