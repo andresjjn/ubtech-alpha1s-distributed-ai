@@ -48,6 +48,9 @@ import threading
 
 from alpha1s_usb import Alpha1SUSB
 from stream_parser import speak_stream   # Fase 4: turno por streaming SSE
+from choreographer import (              # Fase 1 v2: gestos continuos
+    build_playlist, load_gesture_durations, coverage as _gesture_coverage,
+)
 
 # Cache de bateria: se lee en startup y se refresca en background.
 # El firmware del Alpha 1S no responde a 0x18 durante operacion activa.
@@ -163,15 +166,21 @@ def _calc_rms(data_bytes):
 
 
 def _mark(stage):
-    """Wrapper seguro sobre metrics.mark(). No falla si metrics es None."""
+    """Wrapper seguro sobre metrics.mark(). Nunca bloquea la operacion."""
     if metrics is not None:
-        metrics.mark(stage)
+        try:
+            metrics.mark(stage)
+        except Exception:
+            pass
 
 
 def _set_meta(**kwargs):
-    """Wrapper seguro sobre metrics.set_meta()."""
+    """Wrapper seguro sobre metrics.set_meta(). Tolera campos nuevos."""
     if metrics is not None:
-        metrics.set_meta(**kwargs)
+        try:
+            metrics.set_meta(**kwargs)
+        except Exception:
+            pass
 
 
 # ---------- HEARTBEAT USB ----------
@@ -217,6 +226,17 @@ def generate_tts_wav(text, voice_model_path, output_wav_path="response.wav"):
         return None
 
 
+def wav_duration_s(wav_path):
+    """Duracion REAL de un WAV en segundos (frames / samplerate). 0.0 si falla."""
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / float(rate) if rate else 0.0
+    except Exception as e:
+        print("[PI] No pude medir duracion del WAV: " + str(e))
+        return 0.0
+
+
 def play_wav_file(wav_path):
     """Reproduce un WAV. Bloqueante. Limpia el archivo al final."""
     p = pyaudio.PyAudio()
@@ -256,43 +276,68 @@ def speak(text, voice_model_path):
 
 def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
     """
-    Reproduce el TTS y los gestos EN PARALELO.
+    Reproduce el TTS y gestos CONTINUOS en paralelo (Fase 1 v2).
+
+    Objetivo: mientras suene la voz, el robot SIEMPRE gesticula, y el tiempo
+    de movimiento iguala la duracion REAL del audio.
 
     Flujo:
-      1. Genera el WAV de Piper (bloqueante, ~50-500ms).
-      2. Lanza thread de gestos.
-      3. Reproduce el WAV en el thread principal.
-      4. Espera al thread de gestos con margen de gracia.
-      5. Vuelve a pose init para postura segura.
+      1. Genera el WAV de Piper y mide su duracion real (no se estima).
+      2. build_playlist() coreografia gestos que cubren esa duracion,
+         conservando la semilla semantica del LLM (apertura/desarrollo/cierre).
+      3. Thread de gestos: ejecuta la playlist; si el audio sigue sonando al
+         terminarla, sigue rellenando (bucle de garantia: nunca quieto).
+      4. Reproduce el WAV (bloqueante) en el thread principal.
+      5. Al terminar el audio: stop_event -> corte limpio por frame (<1s).
+      6. Vuelta suave a init para postura segura.
     """
-    if not gesture_sequence or robot is None:
+    if robot is None:
         speak(text, voice_model_path)
         return
-
-    print("[PI] Hablando con gestos: " + text)
-    print("[GESTURE] Secuencia: " + str(gesture_sequence))
 
     wav_path = generate_tts_wav(text, voice_model_path)
     if not wav_path:
         print("[PI] Fallo TTS. Cancelando gestos.")
         return
 
-    stop_event  = threading.Event()
-    usb_marked  = {"done": False}
+    audio_s  = wav_duration_s(wav_path)
+    playlist = build_playlist(gesture_sequence or [], audio_s, GESTURE_CATALOG)
+
+    print("[PI] Hablando con gestos: " + text)
+    print("[GESTURE] Audio: " + str(round(audio_s, 1)) + "s | semilla LLM: "
+          + str(gesture_sequence or []) + " | playlist: " + str(playlist))
+
+    if not playlist:
+        # Frase muy corta: hablar sin gestos (un gesto truncado se ve peor).
+        play_wav_file(wav_path)
+        return
+
+    stop_event = threading.Event()
+    usb_marked = {"done": False}
 
     def run_gestures():
-        for gesture_name in gesture_sequence:
-            if stop_event.is_set():
-                print("[GESTURE] Stop recibido, abortando secuencia.")
-                break
+        idx = 0
+        seq = list(playlist)
+        last = seq[-1] if seq else None
+        while not stop_event.is_set():
+            if idx >= len(seq):
+                # Audio aun suena y se acabo la playlist: rellenar para no
+                # quedar quieto. Pide un tramo mas al coreografo (2s extra).
+                extra = build_playlist([], 3.0, GESTURE_CATALOG)
+                extra = [g for g in extra if g != last] or extra
+                if not extra:
+                    break
+                seq.extend(extra)
+                last = seq[-1]
+            gesture_name = seq[idx]
+            idx += 1
             if gesture_name not in GESTURE_CATALOG:
-                print("[GESTURE] '" + gesture_name + "' no en catalogo. Saltando.")
                 continue
             try:
                 if not usb_marked["done"]:
                     _mark("t7_usb_command_sent")
                     usb_marked["done"] = True
-                play_gesture(gesture_name, robot)
+                play_gesture(gesture_name, robot, stop_event=stop_event)
             except Exception as e:
                 print("[GESTURE] Error en '" + gesture_name + "': " + str(e))
 
@@ -301,17 +346,18 @@ def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
 
     play_wav_file(wav_path)
 
-    gesture_thread.join(timeout=1.5)
+    # El audio termino: cortar los gestos de inmediato (por frame, <1s).
+    stop_event.set()
+    gesture_thread.join(timeout=2.0)
     if gesture_thread.is_alive():
-        print("[SYNC] Audio termino antes que los gestos. Senalando stop.")
-        stop_event.set()
-        gesture_thread.join(timeout=3.0)
-        if gesture_thread.is_alive():
-            print("[SYNC] Advertencia: thread de gestos no termino limpiamente.")
+        print("[SYNC] Advertencia: thread de gestos no termino limpiamente.")
 
-    # Volver a init para postura segura
+    cov = _gesture_coverage(playlist, audio_s, GESTURE_CATALOG)
+    _set_meta(gesture_coverage=round(cov, 3))
+
+    # Volver a init (suave) para postura segura
     try:
-        robot.set_all_servos(STATIC_POSES["init"], speed=50)
+        robot.set_all_servos(STATIC_POSES["init"], speed=30)
         sleep(0.5)
     except Exception as e:
         print("[GESTURE] Error volviendo a init: " + str(e))
@@ -646,12 +692,16 @@ def play_sequence(sequence_name, robot, return_to_init=True):
     return "hecho"
 
 
-def play_gesture(gesture_name, robot):
+def play_gesture(gesture_name, robot, stop_event=None):
     """
     Ejecuta un gesto corporal (archivo en gestures/).
     Usa _send_no_reply() para no esperar ACK en cada frame:
     gestos mas fluidos y sincronizados con el audio.
     NO vuelve a init al final — lo hace speak_with_gestures().
+
+    stop_event (Fase 1 v2): si se activa, el gesto se corta ENTRE frames
+    (<1s) en vez de esperar a terminar. Permite que los gestos paren en
+    cuanto el audio termina, sin dejar movimientos colgando.
     """
     file_path = os.path.join(GESTURES_DIR, gesture_name + ".txt")
     if not os.path.exists(file_path):
@@ -666,6 +716,8 @@ def play_gesture(gesture_name, robot):
 
     print("[GESTURE] Ejecutando '" + gesture_name + "' (" + str(len(frames)) + " frames)...")
     for frame in frames:
+        if stop_event is not None and stop_event.is_set():
+            break   # corte limpio por frame
         angles  = frame["angles"]
         time_ms = frame["time_ms"]
         speed   = max(1, int(time_ms / 20))
@@ -764,23 +816,10 @@ def handle_robot_action(action_json, robot):
                         print("[ROBOT] Gestos invalidos descartados: " + str(invalid))
                     gesture_sequence = valid if valid else None
 
-            # Fallback: si el LLM dejo gesture_sequence vacia (o todos sus
-            # gestos fueron descartados) y la respuesta tiene 4+ palabras,
-            # asignar gestos por defecto segun duracion estimada.
-            if gesture_sequence is None and response_text:
-                words = len(response_text.split())
-                if words >= 4:
-                    dur_s = words / 2.5
-                    if dur_s <= 3.5:
-                        gesture_sequence = ["enfatizar_breve"]
-                    elif dur_s <= 7.0:
-                        gesture_sequence = ["explicar_derecha", "afirmar"]
-                    else:
-                        gesture_sequence = ["explicar_derecha", "hablar_relajado",
-                                            "explicar_izquierda"]
-                    print("[ROBOT] gesture_sequence ausente — fallback por duracion "
-                          + str(round(dur_s, 1)) + "s: " + str(gesture_sequence))
-
+            # Nota: ya NO hay fallback por duracion aqui. speak_with_gestures()
+            # llama a build_playlist(), que coreografia gestos continuos a
+            # partir de la semilla del LLM (o desde cero si viene vacia) usando
+            # la duracion REAL del audio. La semilla puede ser None/[].
             _set_meta(
                 response_text=response_text or "",
                 gesture_count=len(gesture_sequence) if gesture_sequence else 0,
@@ -908,9 +947,14 @@ def handle_robot_action(action_json, robot):
 
 # ---------- MAIN ----------
 def main():
-    global metrics
+    global metrics, GESTURE_CATALOG
 
     print("Inicializando asistente de voz para Alpha 1S...")
+
+    # Fase 1 v2: calibrar las duraciones de gestos con el tiempo REAL de cada
+    # archivo. Las constantes hardcodeadas tenian hasta 1.5s de error.
+    GESTURE_CATALOG = load_gesture_durations(GESTURES_DIR, GESTURE_CATALOG)
+    print("[PI] Duraciones de gestos calibradas desde " + GESTURES_DIR + "/")
 
     if _METRICS_AVAILABLE:
         metrics = InteractionMetrics(csv_path=METRICS_CSV_PATH)
@@ -1047,7 +1091,11 @@ def main():
                                     response_to_speak = llm_output
 
                             if response_to_speak:
-                                if gesture_sequence and robot:
+                                if robot:
+                                    # Siempre por speak_with_gestures: coreografia
+                                    # gestos continuos aunque la semilla venga
+                                    # vacia. Frases muy cortas no gesticulan
+                                    # (lo decide build_playlist por duracion).
                                     speak_with_gestures(
                                         response_to_speak, voice_model,
                                         gesture_sequence, robot
