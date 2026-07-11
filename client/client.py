@@ -34,6 +34,7 @@ que se ejecutan EN PARALELO con la voz de Piper.
 """
 
 import os
+import time
 import wave
 import requests
 import pyaudio
@@ -64,12 +65,15 @@ except Exception as _e:
 
 # ---------- CONFIG ----------
 WAKE_WORD = "alfa"
+# V3: palabras que cancelan una mision en curso (se escuchan DURANTE la mision)
+CANCEL_WORDS = ("cancela", "cancelar", "detente", "alto")
 TEMP_AUDIO_FILENAME = "temp_recording.wav"
 
-SERVER_IP      = "192.168.1.10"
+SERVER_IP      = "192.168.1.7"
 SERVER_URL     = "http://" + SERVER_IP + ":3000/query"
 TRANSCRIBE_URL = "http://" + SERVER_IP + ":3000/transcribe"
 STREAM_URL     = "http://" + SERVER_IP + ":3000/query_stream"
+VISION_URL     = "http://" + SERVER_IP + ":3000/vision"   # V3: percepcion para misiones
 
 # Fase 4: streaming SSE. False = flujo no-stream actual (intacto).
 # True = habla por frases y lanza gestos en paralelo. Probar en hardware.
@@ -82,7 +86,7 @@ CHANNELS             = 1
 FORMAT               = pyaudio.paInt16
 SILENCE_THRESHOLD    = 300
 SILENCE_DURATION     = 2
-MAX_RECORDING_SECONDS = 30
+MAX_RECORDING_SECONDS = 10
 
 # Microfono USB: index 2 = pulse (PulseAudio, resamplea 44100->16kHz).
 # Index 0 = hw:2,0 directo, falla con paInvalidSampleRate a 16kHz.
@@ -118,6 +122,12 @@ SEQUENCE_FILES = {
     "mover_a_la_derecha":          "mover_a_la_derecha.txt",
     "mover_a_la_izquierda":        "mover_a_la_izquierda.txt",
     "posicion_inicial":            "posicion_inicial.txt",
+    "abrazar_objeto":              "abrazar_objeto.txt",   # V3 — termina sosteniendo
+    "soltar_objeto":               "soltar_objeto.txt",    # V3 — salida segura (Ley 2)
+    "paso_adelante":               "paso_adelante.txt",    # V3 — 1 ciclo (~2.5 cm)
+    "paso_atras":                  "paso_atras.txt",       # V3 — 1 ciclo hacia atras
+    "paso_izquierda":              "paso_izquierda.txt",   # V3 — 1 paso lateral (~3 cm)
+    "paso_derecha":                "paso_derecha.txt",     # V3 — 1 paso lateral (~3 cm)
 }
 
 GESTURE_CATALOG = {
@@ -603,11 +613,14 @@ def load_sequence_from_file(sequence_name):
         return None, "Error parseando '" + file_path + "': " + str(e)
 
 
-def play_sequence(sequence_name, robot):
+def play_sequence(sequence_name, robot, return_to_init=True):
     """
     Ejecuta una secuencia bloqueante (movimiento completo).
     Usa set_all_servos() — el ACK de cada frame es tolerado porque
     las secuencias no son time-critical como los gestos paralelos.
+
+    return_to_init=False: mantiene la pose del ultimo frame (V3: el robot
+    debe quedarse abrazando el objeto, no abrir los brazos al terminar).
     """
     print("[ROBOT] Cargando secuencia '" + sequence_name + "'...")
     frames, error = load_sequence_from_file(sequence_name)
@@ -626,8 +639,9 @@ def play_sequence(sequence_name, robot):
         robot.set_all_servos(angles, speed=speed)
         sleep(time_ms / 1000.0)
 
-    robot.set_all_servos(STATIC_POSES["init"], speed=50)
-    sleep(1)
+    if return_to_init:
+        robot.set_all_servos(STATIC_POSES["init"], speed=50)
+        sleep(1)
     print("[ROBOT] Secuencia '" + sequence_name + "' finalizada.")
     return "hecho"
 
@@ -660,6 +674,39 @@ def play_gesture(gesture_name, robot):
         pkt = robot._build_packet(0x23, list(angles) + [speed, 20])
         robot._send_no_reply(pkt)
         sleep(time_ms / 1000.0)
+
+
+# ---------- V3: CANCELACION DE MISION POR VOZ ----------
+def _listen_for_cancel(cancel_event, stop_event):
+    """
+    Thread daemon que escucha DURANTE una mision. Si oye alguna palabra
+    de CANCEL_WORDS, activa cancel_event y la mision aborta al inicio
+    del siguiente ciclo (la primitiva en curso termina primero).
+    Usa su propio Recognizer/Microphone: el stream principal esta detenido
+    mientras la mision corre, asi que el microfono esta libre.
+    """
+    try:
+        rec = sr.Recognizer()
+        mic = sr.Microphone(sample_rate=RATE, device_index=MIC_DEVICE_INDEX)
+        with mic as source:
+            rec.adjust_for_ambient_noise(source, duration=0.5)
+            print("[MISSION] Escuchando cancelacion (di: " +
+                  " / ".join(CANCEL_WORDS) + ")")
+            while not stop_event.is_set():
+                try:
+                    audio = rec.listen(source, timeout=2, phrase_time_limit=3)
+                    text = rec.recognize_google(audio, language="es-ES").lower()
+                    print("[MISSION] Oido: '" + text + "'")
+                    if any(w in text for w in CANCEL_WORDS):
+                        print("[MISSION] CANCELACION por voz.")
+                        cancel_event.set()
+                        return
+                except sr.WaitTimeoutError:
+                    continue
+                except (sr.UnknownValueError, sr.RequestError):
+                    continue
+    except Exception as e:
+        print("[MISSION] Listener de cancelacion no disponible: " + str(e))
 
 
 # ---------- DESPACHADOR ----------
@@ -733,7 +780,12 @@ def handle_robot_action(action_json, robot):
         if action_type == "execute_sequence":
             sequence_name = parameters.get("sequence_name")
             if sequence_name in SEQUENCE_FILES:
-                result = play_sequence(sequence_name, robot)
+                # abrazar_objeto termina sosteniendo el objeto: volver a INIT
+                # soltaria el cubo y violaria la Ley 2 (codo cerrado -> INIT).
+                # La salida segura es la secuencia soltar_objeto.
+                keep_pose = (sequence_name == "abrazar_objeto")
+                result = play_sequence(sequence_name, robot,
+                                       return_to_init=(not keep_pose))
                 if isinstance(result, tuple):
                     return None, None, result[1]
                 resp = action_data.get("response") or None
@@ -751,6 +803,72 @@ def handle_robot_action(action_json, robot):
                 )
                 return resp, None, None
             return None, None, "Estado invalido para LEDs."
+
+        # V3: mision de servovision — buscar el objetivo, caminar hasta el
+        # y asegurarlo. Lazo cerrado: GET /vision -> primitiva -> re-percibir.
+        # Cancelable por voz: di "cancela" / "alto" durante la mision.
+        if action_type == "fetch_object":
+            target = parameters.get("target") or "aruco"
+            print("[MISSION] Objetivo: '" + target + "'")
+            try:
+                from mission import FetchMission
+            except Exception as e:
+                return None, None, "mission.py no disponible: " + str(e)
+
+            def _get_perception():
+                try:
+                    r = requests.get(VISION_URL, timeout=2)
+                    return r.json().get("detections") or []
+                except Exception:
+                    return []
+
+            cancel_event  = threading.Event()
+            stop_listener = threading.Event()
+            threading.Thread(
+                target=_listen_for_cancel,
+                args=(cancel_event, stop_listener),
+                daemon=True,
+            ).start()
+
+            _mark("t7_usb_command_sent")
+            m = FetchMission(
+                target,
+                _get_perception,
+                # init=False encadena pasos de una rafaga sin volver a INIT
+                lambda p, init=True: play_sequence(p, robot,
+                                                   return_to_init=init),
+                say=lambda t: print("[MISSION] " + t),
+                cancel_event=cancel_event,
+            )
+            try:
+                result = m.run()
+            except OSError as e:
+                # USB del robot perdido a mitad de secuencia (Errno 5/19):
+                # abortar limpio en vez de dejar el listener colgado.
+                print("[MISSION] USB perdido durante la mision: " + str(e))
+                return "Perdi la conexion con el robot.", None, None
+            finally:
+                stop_listener.set()
+            print("[MISSION] Resultado: " + result
+                  + " | primitivas: " + str(len(m.log)))
+
+            if result == "arrived":
+                if "abrazar_objeto" in SEQUENCE_FILES:
+                    # return_to_init=False: queda erguido sosteniendo el objeto
+                    play_sequence("abrazar_objeto", robot, return_to_init=False)
+                    return "Objeto asegurado.", None, None
+                return "He llegado al objeto.", None, None
+            if result == "cancelled":
+                # un cancel a mitad de rafaga deja al robot en postura de
+                # marcha: restaurar INIT antes de quedarse quieto
+                try:
+                    robot.set_all_servos(STATIC_POSES["init"], speed=50)
+                except OSError:
+                    pass
+                return "Misión cancelada.", None, None
+            if result == "not_found":
+                return "No encuentro el objeto.", None, None
+            return "Detuve la busqueda por seguridad.", None, None
 
         return None, None, "Accion '" + str(action_type) + "' no reconocida."
 
@@ -826,7 +944,11 @@ def main():
         while True:
             if listen_for_wake_word(recognizer, microphone):
                 if robot:
-                    robot.set_led(True)
+                    try:
+                        robot.set_led(True)
+                    except OSError as e:
+                        # USB del robot caido (cable): no tumbar el cliente
+                        print("[ROBOT] USB perdido en set_led: " + str(e))
                 stream.start_stream()
                 audio_frames = record_audio(stream)
                 stream.stop_stream()
@@ -910,7 +1032,10 @@ def main():
                     _set_meta(error="empty_transcription")
 
                 if robot:
-                    robot.set_led(False)
+                    try:
+                        robot.set_led(False)
+                    except OSError as e:
+                        print("[ROBOT] USB perdido en set_led: " + str(e))
 
                 if metrics is not None:
                     metrics.commit()
