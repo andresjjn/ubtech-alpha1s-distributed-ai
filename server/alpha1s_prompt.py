@@ -31,7 +31,7 @@ LLM_MODEL = "qwen2.5-vl-7b-instruct"
 
 LLM_PARAMS = dict(
     temperature=0.4,
-    max_tokens=256,
+    max_tokens=512,   # Fase 3: permite respuestas largas / cuentacuentos
     top_p=0.9,
     frequency_penalty=0.15,
 )
@@ -228,6 +228,9 @@ Usuario: "Explícame qué es la fotosíntesis."
 
 Usuario: "Cuéntame algo sobre Marte."
 {"gesture_sequence": ["pensar", "explicar_derecha", "explicar_izquierda", "enfatizar_breve"], "action": "none", "target": "none", "response": "Marte es el cuarto planeta del sistema solar. Su color rojizo viene del óxido de hierro en su superficie, y un día marciano dura casi lo mismo que uno terrestre."}
+
+Usuario: "Cuéntame un cuento corto"
+{"gesture_sequence": ["pensar", "explicar_ambos", "hablar_relajado", "reverencia"], "action": "none", "target": "none", "response": "Había una vez un pequeño robot que soñaba con contar estrellas. Cada noche salía al jardín y anotaba una nueva en su cuaderno. Una noche descubrió que la estrella más brillante era en realidad su propio reflejo en un charco. Entendió que la luz que buscaba la llevaba dentro. Y desde entonces, brilló para los demás."}
 
 Usuario: "¿Estás seguro?"
 {"gesture_sequence": ["afirmar"], "action": "none", "target": "none", "response": "Sí, completamente seguro de lo que digo."}
