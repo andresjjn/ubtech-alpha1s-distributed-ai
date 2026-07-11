@@ -77,6 +77,13 @@ SERVER_URL     = "http://" + SERVER_IP + ":3000/query"
 TRANSCRIBE_URL = "http://" + SERVER_IP + ":3000/transcribe"
 STREAM_URL     = "http://" + SERVER_IP + ":3000/query_stream"
 VISION_URL     = "http://" + SERVER_IP + ":3000/vision"   # V3: percepcion para misiones
+HEALTH_URL     = "http://" + SERVER_IP + ":3000/health"   # Fase 2: verificar contrato
+
+# Version del contrato que este cliente entiende. Se compara con /health.
+try:
+    from alpha1s_prompt import CONTRACT_VERSION as CLIENT_CONTRACT
+except Exception:
+    CLIENT_CONTRACT = "v2"
 
 # Fase 4: streaming SSE. False = flujo no-stream actual (intacto).
 # True = habla por frases y lanza gestos en paralelo. Probar en hardware.
@@ -584,6 +591,36 @@ def _battery_refresh_loop(robot, stop_event):
             print("[BATTERY] Cache refrescada: " + str(pct) + "%")
 
 
+def check_server_health(voice_model=None):
+    """
+    Consulta /health y verifica que el servidor hable el mismo contrato.
+    Fase 2: evita el bug de despliegue asimetrico (Pi nuevo / ROG viejo o
+    viceversa). Devuelve True si todo cuadra o si no se pudo verificar
+    (no bloquea el arranque); avisa por voz si hay desajuste de contrato.
+    """
+    try:
+        r = requests.get(HEALTH_URL, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+    except requests.exceptions.RequestException as e:
+        print("[HEALTH] No pude verificar el servidor: " + str(e))
+        return True   # servidor viejo sin /health o inaccesible: no bloquear
+
+    server_contract = data.get("contract", "?")
+    print("[HEALTH] Servidor OK | contrato=" + str(server_contract)
+          + " modelo=" + str(data.get("model", "?"))
+          + " stt=" + str(data.get("stt", "?")))
+    if server_contract != CLIENT_CONTRACT:
+        msg = ("[HEALTH] DESAJUSTE DE CONTRATO: cliente=" + CLIENT_CONTRACT
+               + " servidor=" + str(server_contract))
+        print(msg)
+        if voice_model is not None:
+            speak("Atención: el servidor usa una versión distinta a la mía. "
+                  "Puede que algunas acciones no funcionen.", voice_model)
+        return False
+    return True
+
+
 def query_llm_server(text, battery_pct=None):
     """
     Envia el texto al ROG /query y retorna el JSON del LLM como string.
@@ -963,6 +1000,10 @@ def main():
         print("[PI] Corriendo SIN metricas.")
 
     voice_model     = initialize_piper_voice()
+
+    # Fase 2: verificar que el servidor hable el mismo contrato (v2).
+    check_server_health(voice_model)
+
     recognizer      = sr.Recognizer()
     microphone      = sr.Microphone(sample_rate=RATE, device_index=MIC_DEVICE_INDEX)
     audio_interface = pyaudio.PyAudio()

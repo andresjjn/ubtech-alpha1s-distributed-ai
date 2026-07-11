@@ -18,6 +18,10 @@ El campo "parameters" del contrato v1 se eliminó: un objeto anidado con
 subcampos opcionales sufría el mismo problema. "target" lo reemplaza plano.
 """
 
+# Version del contrato JSON. El cliente la compara contra /health para
+# detectar despliegues asimetricos Pi/ROG (ver server.py y client.py).
+CONTRACT_VERSION = "v2"
+
 # ── Configuración LLM ─────────────────────────────────────────────────────────
 LLM_API_BASE_URL = "http://localhost:1234/v1"
 # ⚠️  Verificar string exacto en LM Studio → Models. Distingue mayúsculas.
@@ -40,7 +44,7 @@ GESTURE_NAMES = [
     "enfatizar_breve", "afirmar", "presentarse", "senalar_adelante",
     "pensar", "explicar_derecha", "explicar_izquierda",
     "brazos_abiertos_bienvenida", "explicar_ambos", "hablar_relajado",
-    "saludar", "despedirse",
+    "saludar", "despedirse", "reverencia",
 ]
 
 SEQUENCE_NAMES = [
@@ -162,6 +166,7 @@ explicar_ambos       5.3s   explicación larga con ambas manos
 hablar_relajado      5.4s   relleno neutro para respuestas largas
 saludar              3.5s   saludo con brazo arriba
 despedirse           4.0s   despedida con brazo lateral
+reverencia           5.0s   inclinacion de cortesia (agradecer, fin de acto)
 
 ════════════════════════════════════════
 CÓMO ELEGIR GESTOS (coreografía de la narración)
@@ -197,6 +202,7 @@ Intención → gesto:
   narrar tramo largo neutro    → hablar_relajado
   invitar a mirar / futuro     → senalar_adelante
   despedirse                   → despedirse
+  agradecer / cortesia / fin   → reverencia
 
 Ejemplos de presupuesto de tiempo:
   Respuesta de 8 palabras  → ~3.2s → 1 gesto  (afirmar 2.4s)
@@ -231,6 +237,9 @@ Usuario: "La capital de Colombia es Lima."
 
 Usuario: "Adiós"
 {"gesture_sequence": ["despedirse"], "action": "none", "target": "none", "response": "Hasta pronto, fue un gusto ayudarte hoy."}
+
+Usuario: "Muchas gracias por tu ayuda"
+{"gesture_sequence": ["afirmar", "reverencia"], "action": "none", "target": "none", "response": "Ha sido un placer. Estoy aquí siempre que me necesites."}
 
 Usuario: "Muéstrame algo interesante"
 {"gesture_sequence": ["senalar_adelante", "enfatizar_breve"], "action": "none", "target": "none", "response": "Puedo contarte sobre inteligencia artificial, robótica o lo que quieras explorar."}
