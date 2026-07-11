@@ -84,7 +84,7 @@ HEALTH_URL     = "http://" + SERVER_IP + ":3000/health"   # Fase 2: verificar co
 try:
     from alpha1s_prompt import CONTRACT_VERSION as CLIENT_CONTRACT
 except Exception:
-    CLIENT_CONTRACT = "v2"
+    CLIENT_CONTRACT = "v3"
 
 # Fase 4: streaming SSE. False = flujo no-stream actual (intacto).
 # True = habla por frases y lanza gestos en paralelo. Probar en hardware.
@@ -986,29 +986,59 @@ def handle_robot_action(action_json, robot, battery_pct=None):
             return None, None, "Pose desconocida: '" + str(pose_name) + "'."
 
         if action_type == "execute_sequence":
-            sequence_name = parameters.get("sequence_name") or target
-            if sequence_name in SEQUENCE_FILES:
-                # Fase 3: con bateria baja, rechazar secuencias de alto consumo
-                # para evitar un brownout a mitad del movimiento.
-                bpol, bmsg = battery_policy(battery_pct, sequence_name)
+            # v3: "targets" (lista) encadena varias secuencias; si no viene,
+            # "target"/sequence_name ejecuta una sola (compatibilidad v2).
+            targets = action_data.get("targets")
+            seqs = ([t for t in targets if t in SEQUENCE_FILES]
+                    if isinstance(targets, list) else [])
+            single = parameters.get("sequence_name") or target
+            if not seqs and single in SEQUENCE_FILES:
+                seqs = [single]
+            if not seqs:
+                return None, None, ("Secuencia desconocida: '"
+                                    + str(single or targets) + "'.")
+
+            # Fase 3: si CUALQUIER paso es de alto consumo y la bateria esta
+            # baja, rechazar toda la cadena (evita brownout a mitad).
+            for s in seqs:
+                bpol, bmsg = battery_policy(battery_pct, s)
                 if bpol in ("reject", "rest"):
-                    print("[BATTERY] Secuencia '" + sequence_name
-                          + "' bloqueada por bateria (" + bpol + ").")
+                    print("[BATTERY] Cadena bloqueada por bateria en '" + s
+                          + "' (" + bpol + ").")
                     return bmsg, None, None
-                # abrazar_objeto termina sosteniendo el objeto: volver a INIT
-                # soltaria el cubo y violaria la Ley 2 (codo cerrado -> INIT).
-                # La salida segura es la secuencia soltar_objeto.
-                keep_pose = (sequence_name == "abrazar_objeto")
-                result = play_sequence(sequence_name, robot,
-                                       return_to_init=(not keep_pose))
-                if isinstance(result, tuple):
-                    return None, None, result[1]
-                # Fase 3: verificar postura tras volver a init (opcode 0x25).
-                if not keep_pose:
-                    _verify_posture(robot)
-                resp = action_data.get("response") or None
-                return resp, None, None
-            return None, None, "Secuencia desconocida: '" + str(sequence_name) + "'."
+
+            # Cancelacion por voz solo tiene sentido en cadenas de 2+ pasos.
+            cancel_event  = threading.Event()
+            stop_listener = threading.Event()
+            if len(seqs) > 1:
+                print("[ROBOT] Cadena de " + str(len(seqs)) + " secuencias: "
+                      + str(seqs))
+                threading.Thread(
+                    target=_listen_for_cancel,
+                    args=(cancel_event, stop_listener),
+                    daemon=True,
+                ).start()
+
+            try:
+                for s in seqs:
+                    if cancel_event.is_set():
+                        robot.set_all_servos(STATIC_POSES["init"], speed=40)
+                        return "Secuencia cancelada.", None, None
+                    # abrazar_objeto termina sosteniendo el objeto: no volver a
+                    # INIT (soltaria el cubo, Ley 2). Salida segura: soltar_objeto.
+                    keep_pose = (s == "abrazar_objeto")
+                    result = play_sequence(s, robot,
+                                           return_to_init=(not keep_pose))
+                    if isinstance(result, tuple):
+                        return None, None, result[1]
+                    # Fase 3: verificar postura tras volver a init (opcode 0x25).
+                    if not keep_pose:
+                        _verify_posture(robot)
+            finally:
+                stop_listener.set()
+
+            resp = action_data.get("response") or None
+            return resp, None, None
 
         if action_type == "control_led":
             state = parameters.get("state")
