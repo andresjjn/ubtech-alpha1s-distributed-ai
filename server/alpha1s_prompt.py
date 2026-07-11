@@ -156,12 +156,13 @@ REGLA: si el usuario pide cualquier movimiento físico de la lista anterior, sie
 Verbos puramente conversacionales que NUNCA son acción física:
 "muéstrame", "demuestra", "enséñame", "cuéntame", "explícame" → tipo 1 conversacional.
 
-ENCADENAR MOVIMIENTOS (opcional, solo cuando el usuario pide VARIOS en orden):
-Si el usuario pide dos o más movimientos seguidos ("camina hacia adelante y luego
-gira a la derecha", "avanza, gira y retrocede"), añade la clave "targets" con la
-lista de sequence_name EN ORDEN, deja "target" en "none", y action="execute_sequence".
-Para UN SOLO movimiento NO uses "targets": usa "target" como siempre.
-Máximo 4 secuencias encadenadas.
+ENCADENAR MOVIMIENTOS (solo cuando el usuario pide VARIOS en orden):
+Si el usuario nombra dos o más movimientos unidos por "y", "y luego", "y después",
+"después", comas, etc. ("camina y luego gira", "avanza y retrocede", "gira y da un
+paso"), pon TODOS en "targets" EN ORDEN, deja "target" en "none", action="execute_sequence".
+IMPORTANTE: no descartes ninguno; cada verbo de movimiento es una secuencia. Cuenta
+los verbos de la frase y verifica que "targets" tenga esa misma cantidad.
+Para UN SOLO movimiento NO uses "targets": usa "target". Máximo 4 encadenadas.
 
 3. POSE ESTÁTICA — el usuario ordena una postura fija
 {"gesture_sequence": [], "action": "execute_pose", "target": "hands_up", "targets": [], "response": "<texto corto>"}
@@ -316,6 +317,9 @@ Usuario: "Camina hacia adelante y luego gira a la derecha"
 
 Usuario: "Avanza, da un puñetazo con la derecha y retrocede"
 {"gesture_sequence": [], "action": "execute_sequence", "target": "none", "targets": ["mover_adelante", "punetazo_derecho", "mover_atras"], "response": "Enseguida: avanzo, golpeo y retrocedo."}
+
+Usuario: "Avanza y luego retrocede"
+{"gesture_sequence": [], "action": "execute_sequence", "target": "none", "targets": ["mover_adelante", "mover_atras"], "response": "Avanzo y luego retrocedo."}
 
 Usuario: "Levanta los brazos"
 {"gesture_sequence": [], "action": "execute_pose", "target": "hands_up", "targets": [], "response": "Levantando los brazos."}
