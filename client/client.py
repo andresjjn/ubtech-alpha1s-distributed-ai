@@ -51,6 +51,7 @@ from stream_parser import speak_stream   # Fase 4: turno por streaming SSE
 from choreographer import (              # Fase 1 v2: gestos continuos
     build_playlist, load_gesture_durations, coverage as _gesture_coverage,
 )
+from behaviors import battery_policy, posture_ok   # Fase 3 v2: comportamientos
 
 # Cache de bateria: se lee en startup y se refresca en background.
 # El firmware del Alpha 1S no responde a 0x18 durante operacion activa.
@@ -107,6 +108,12 @@ METRICS_CSV_PATH = "metrics.csv"
 
 # Heartbeat USB: evita timeout de inactividad en el robot.
 USB_HEARTBEAT_INTERVAL = 8   # segundos
+
+# Fase 3: tras este tiempo sin interaccion, el robot entra en reposo
+# (postura init + LED apagado + frase breve). 0 o None lo desactiva.
+IDLE_REST_SECONDS = 300      # 5 minutos
+# Fase 3: no repetir el aviso de bateria mas de una vez cada X segundos.
+BATTERY_WARN_COOLDOWN = 120
 
 # ---------- SALUDO INICIAL ----------
 STARTUP_GREETING_TEXT = (
@@ -208,6 +215,52 @@ def _start_heartbeat(robot, stop_event):
     t = threading.Thread(target=_loop, daemon=True, name="usb-heartbeat")
     t.start()
     return t
+
+
+# ---------- FASE 3: LED EXPRESIVO POR ESTADO ----------
+class LedController:
+    """
+    Maquina de estados visible en el LED ocular. Un thread daemon aplica el
+    modo actual sin bloquear el flujo principal:
+      'off'   -> apagado (reposo)
+      'on'    -> fijo encendido (escuchando / hablando)
+      'blink' -> parpadeo lento (~1 Hz, "pensando": esperando al servidor)
+    Usa el lock HID interno del robot, asi que es seguro junto a gestos.
+    """
+    def __init__(self, robot, period=0.5):
+        self.robot   = robot
+        self.period  = period
+        self._mode   = "off"
+        self._stop   = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self.robot is None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="led-controller")
+        self._thread.start()
+
+    def set(self, mode):
+        self._mode = mode
+
+    def _loop(self):
+        on_now = None   # estado fisico actual del LED (None = desconocido)
+        while not self._stop.wait(self.period):
+            mode = self._mode
+            try:
+                if mode == "blink":
+                    on_now = not bool(on_now)
+                    self.robot.set_led(on_now)
+                elif mode == "on" and on_now is not True:
+                    self.robot.set_led(True); on_now = True
+                elif mode == "off" and on_now is not False:
+                    self.robot.set_led(False); on_now = False
+            except OSError:
+                pass   # USB caido: no tumbar el thread
+
+    def stop(self):
+        self._stop.set()
 
 
 # ---------- TTS ----------
@@ -466,19 +519,45 @@ def startup_greeting(robot, voice_model_path):
 
 
 # ---------- AUDIO ----------
-def listen_for_wake_word(recognizer, microphone):
+def listen_for_wake_word(recognizer, microphone, idle_cb=None, idle_after=None):
+    """
+    Espera la palabra de activacion. Devuelve True al detectarla.
+
+    Fase 3: si 'idle_after' (segundos) esta definido y pasa ese tiempo sin
+    NINGUNA voz, llama a idle_cb() UNA vez (rutina de reposo) y sigue
+    escuchando. Cualquier voz reinicia el temporizador de inactividad.
+    """
     print("\n[PI] Di '" + WAKE_WORD + "' para comenzar...")
     with microphone as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        idle_start = time.time()
+        idle_fired = False
         while True:
             try:
-                audio = recognizer.listen(source)
-                text  = recognizer.recognize_google(audio, language="es-ES").lower()
+                if idle_after:
+                    audio = recognizer.listen(source, timeout=8, phrase_time_limit=5)
+                else:
+                    audio = recognizer.listen(source)
+                text = recognizer.recognize_google(audio, language="es-ES").lower()
+                idle_start = time.time()   # hubo voz: reiniciar inactividad
+                idle_fired = False
                 if WAKE_WORD in text:
                     _mark("t0_wake_word_detected")
                     print("[PI] Palabra de activacion detectada.")
                     return True
+            except sr.WaitTimeoutError:
+                if (idle_after and not idle_fired
+                        and time.time() - idle_start >= idle_after):
+                    idle_fired = True
+                    if idle_cb:
+                        try:
+                            idle_cb()
+                        except Exception as e:
+                            print("[IDLE] Error en rutina de reposo: " + str(e))
+                continue
             except (sr.UnknownValueError, sr.RequestError):
+                idle_start = time.time()   # oyo algo (ruido/voz): resetear
+                idle_fired = False
                 continue
 
 
@@ -729,6 +808,35 @@ def play_sequence(sequence_name, robot, return_to_init=True):
     return "hecho"
 
 
+def _verify_posture(robot, expected=None, settle_s=0.4):
+    """
+    Fase 3: tras una secuencia, lee los angulos reales (opcode 0x25) y los
+    compara contra la pose esperada (init por defecto). Si difieren mucho,
+    intenta una vez volver a posicion_inicial. Best-effort: si el sensor no
+    responde (comun durante operacion), no hace nada.
+
+    Devuelve True si la postura es correcta o no se pudo verificar.
+    """
+    if robot is None:
+        return True
+    expected = expected if expected is not None else STATIC_POSES["init"]
+    try:
+        sleep(settle_s)   # dejar que los servos asienten antes de leer
+        measured = robot.read_all_angles()
+    except Exception as e:
+        print("[POSTURE] No pude leer angulos (0x25): " + str(e))
+        return True
+    if posture_ok(measured, expected):
+        return True
+    print("[POSTURE] Postura fuera de rango tras la secuencia. Reintentando init.")
+    try:
+        robot.set_all_servos(STATIC_POSES["init"], speed=40)
+        sleep(1.0)
+    except Exception as e:
+        print("[POSTURE] Error reintentando init: " + str(e))
+    return False
+
+
 def play_gesture(gesture_name, robot, stop_event=None):
     """
     Ejecuta un gesto corporal (archivo en gestures/).
@@ -799,7 +907,7 @@ def _listen_for_cancel(cancel_event, stop_event):
 
 
 # ---------- DESPACHADOR ----------
-def handle_robot_action(action_json, robot):
+def handle_robot_action(action_json, robot, battery_pct=None):
     """
     Despacha la respuesta del LLM (JSON string).
 
@@ -880,6 +988,13 @@ def handle_robot_action(action_json, robot):
         if action_type == "execute_sequence":
             sequence_name = parameters.get("sequence_name") or target
             if sequence_name in SEQUENCE_FILES:
+                # Fase 3: con bateria baja, rechazar secuencias de alto consumo
+                # para evitar un brownout a mitad del movimiento.
+                bpol, bmsg = battery_policy(battery_pct, sequence_name)
+                if bpol in ("reject", "rest"):
+                    print("[BATTERY] Secuencia '" + sequence_name
+                          + "' bloqueada por bateria (" + bpol + ").")
+                    return bmsg, None, None
                 # abrazar_objeto termina sosteniendo el objeto: volver a INIT
                 # soltaria el cubo y violaria la Ley 2 (codo cerrado -> INIT).
                 # La salida segura es la secuencia soltar_objeto.
@@ -888,6 +1003,9 @@ def handle_robot_action(action_json, robot):
                                        return_to_init=(not keep_pose))
                 if isinstance(result, tuple):
                     return None, None, result[1]
+                # Fase 3: verificar postura tras volver a init (opcode 0x25).
+                if not keep_pose:
+                    _verify_posture(robot)
                 resp = action_data.get("response") or None
                 return resp, None, None
             return None, None, "Secuencia desconocida: '" + str(sequence_name) + "'."
@@ -1044,6 +1162,10 @@ def main():
         print("[ROBOT] No se pudo conectar: " + str(e))
         print("[ROBOT] Continuando SIN robot (solo voz).")
 
+    # Fase 3: LED expresivo por estado (thread daemon).
+    led = LedController(robot)
+    led.start()
+
     print("\n" + "=" * 50)
     print("Asistente Alpha 1S iniciado (transport: USB HID)")
     print("=" * 50)
@@ -1051,15 +1173,36 @@ def main():
     startup_greeting(robot, voice_model)
     sleep(1.5)
 
+    # Fase 3: rutina de reposo por inactividad.
+    rest_state = {"resting": False, "last_batt_warn": 0.0}
+
+    def _idle_rest():
+        if rest_state["resting"]:
+            return
+        rest_state["resting"] = True
+        print("[IDLE] Sin interaccion; entrando en reposo.")
+        led.set("off")
+        if robot:
+            try:
+                robot.set_all_servos(STATIC_POSES["init"], speed=30)
+            except OSError:
+                pass
+
+    def _wake_from_rest():
+        if not rest_state["resting"]:
+            return
+        rest_state["resting"] = False
+        print("[IDLE] Despertando de reposo.")
+        startup_greeting(robot, voice_model)
+
     try:
         while True:
-            if listen_for_wake_word(recognizer, microphone):
+            if listen_for_wake_word(recognizer, microphone,
+                                    idle_cb=_idle_rest,
+                                    idle_after=IDLE_REST_SECONDS):
+                _wake_from_rest()
                 if robot:
-                    try:
-                        robot.set_led(True)
-                    except OSError as e:
-                        # USB del robot caido (cable): no tumbar el cliente
-                        print("[ROBOT] USB perdido en set_led: " + str(e))
+                    led.set("on")   # escuchando
                 stream.start_stream()
                 audio_frames = record_audio(stream)
                 stream.stop_stream()
@@ -1082,6 +1225,19 @@ def main():
                     if battery_pct is not None:
                         print("[BATTERY] Nivel actual: " + str(battery_pct) + "%")
 
+                    # Fase 3: avisar de bateria baja/critica (con cooldown para
+                    # no repetirlo en cada turno).
+                    bpol, bmsg = battery_policy(battery_pct, None)
+                    if bpol in ("warn", "rest") and bmsg:
+                        now = time.time()
+                        if now - rest_state["last_batt_warn"] >= BATTERY_WARN_COOLDOWN:
+                            rest_state["last_batt_warn"] = now
+                            speak(bmsg, voice_model)
+
+                    # Fase 3: LED "pensando" mientras se procesa el turno.
+                    if robot:
+                        led.set("blink")
+
                     # --- FASE 4: intentar streaming (opt-in) ---
                     mode, sdata = ("fallback", None)
                     if USE_STREAMING and robot:
@@ -1095,7 +1251,10 @@ def main():
 
                     elif mode == "action":
                         llm_str = json.dumps(sdata, ensure_ascii=False)
-                        rt, _gs, err = handle_robot_action(llm_str, robot)
+                        rt, _gs, err = handle_robot_action(llm_str, robot,
+                                                           battery_pct=battery_pct)
+                        if robot:
+                            led.set("on")
                         if err:
                             print("[ROBOT] ERROR: " + err)
                             _set_meta(error=err)
@@ -1115,7 +1274,7 @@ def main():
 
                             if robot:
                                 response_to_speak, gesture_sequence, error = handle_robot_action(
-                                    llm_output, robot
+                                    llm_output, robot, battery_pct=battery_pct
                                 )
                                 if error:
                                     print("[ROBOT] ERROR: " + error)
@@ -1131,6 +1290,8 @@ def main():
                                 except json.JSONDecodeError:
                                     response_to_speak = llm_output
 
+                            if robot:
+                                led.set("on")   # hablando
                             if response_to_speak:
                                 if robot:
                                     # Siempre por speak_with_gestures: coreografia
@@ -1147,10 +1308,7 @@ def main():
                     _set_meta(error="empty_transcription")
 
                 if robot:
-                    try:
-                        robot.set_led(False)
-                    except OSError as e:
-                        print("[ROBOT] USB perdido en set_led: " + str(e))
+                    led.set("off")   # turno terminado -> reposo visual
 
                 if metrics is not None:
                     metrics.commit()
@@ -1159,6 +1317,7 @@ def main():
         print("\n[PI] Apagando el asistente...")
     finally:
         hb_stop_event.set()   # detener heartbeat
+        led.stop()            # detener LED controller
         if stream.is_active():
             stream.stop_stream()
         stream.close()
