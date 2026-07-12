@@ -165,12 +165,13 @@ TTS incremental moriría. Arreglo: extraer el VALOR de `"action"` y decidir
 v2. Mientras tanto `USE_STREAMING = False` NO se toca.
 
 ### 2.2 Resolver drift repo ↔ Pi
-Verificado: el Pi (`/home/ros/TDD/gestures/`) tiene `saludo_inicial.txt` y
-`error.txt` que el repo no tiene; el repo tiene `saludo.txt` que nada usa; el
-repo guarda `saludo_inicial.txt` en `sequences/` pero `GESTURE_CATALOG` lo trata
-como gesto. Acciones:
+Verificado: el Pi (`/home/ros/TDD/gestures/`) tiene `error.txt` que el repo no
+tiene. RESUELTO 2026-07-12: `saludo.txt` y `saludo_inicial.txt` eliminados del
+repo (duplicaban `saludar` y `reverencia` respectivamente); `saludar` es el
+gesto canonico de saludo. Acciones:
 1. Traer del Pi los archivos que faltan al repo (`scp` DESDE el Pi es lectura).
-2. Decidir hogar único de `saludo_inicial` (gesto → `gestures/`).
+2. RESUELTO 2026-07-12: `saludo_inicial` eliminado del repo (duplicaba
+   `reverencia`); el saludo de arranque usa `reverencia`.
 3. Crear `deploy_pi.sh`: `rsync -av client/ ros@192.168.1.16:/home/ros/TDD/`
    (con `--dry-run` primero y confirmación del usuario).
 4. Documentar en el README el paso manual del ROG.
@@ -178,8 +179,8 @@ como gesto. Acciones:
 ### 2.3 Exponer `reverencia` al LLM
 Está probada en hardware (5.0s reales) pero no está en `GESTURE_NAMES` ni en el
 prompt. Añadirla: enum + catálogo del prompt + intención ("agradecer / recibir
-un cumplido / final de actuación → reverencia"). `saludo_inicial` se queda
-reservado para el arranque (no exponerlo).
+un cumplido / final de actuación → reverencia"). El arranque también usa `reverencia`
+(`saludo_inicial` eliminado 2026-07-12: duplicaba `reverencia`).
 
 ### 2.4 Robustez HID concurrente
 Hay 3 hilos que escriben al mismo `/dev/hidrawX` (heartbeat, gestos, batería en
@@ -236,7 +237,7 @@ Actualizar `handle_robot_action`, prompt (ejemplos "y luego"), y benchmark.
 
 ### 3.6 Rutina de despertar/reposo (esfuerzo: bajo)
 Sin interacción por N minutos (configurable, ej. 5): decir una frase corta de
-reposo, `posicion_inicial`, LED off. Al despertar con "alfa": `saludo_inicial`.
+reposo, `posicion_inicial`, LED off. Al despertar con "alfa": `reverencia`.
 Todo con piezas existentes (timer + catálogos).
 
 ### NO hacer (fuera del hardware actual)

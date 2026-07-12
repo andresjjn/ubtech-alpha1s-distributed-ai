@@ -130,7 +130,7 @@ Alpha1s_modernization/
 │   └── gestures/                   # Arm-only gesture files (run parallel to TTS)
 │       ├── saludar.txt  · despedirse.txt · presentarse.txt · reverencia.txt
 │       ├── brazos_abiertos_bienvenida.txt · pensar.txt · afirmar.txt
-│       ├── enfatizar_breve.txt · senalar_adelante.txt · saludo_inicial.txt
+│       ├── enfatizar_breve.txt · senalar_adelante.txt
 │       └── explicar_derecha.txt · explicar_izquierda.txt · explicar_ambos.txt · hablar_relajado.txt
 │
 ├── server/                         # ROG Ally X — LLM + STT + TTS + Flask
