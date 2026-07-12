@@ -160,7 +160,6 @@ GESTURE_CATALOG = {
     "hablar_relajado":             5.4,
     "despedirse":                  4.0,
     "saludar":                     3.5,
-    "saludo_inicial":              3.5,  # mueve torso, probado en hardware
     "reverencia":                  3.5,  # mueve torso, probado en hardware
 }
 
@@ -511,7 +510,7 @@ def startup_greeting(robot, voice_model_path):
     if robot is not None:
         speak_with_gestures(
             STARTUP_GREETING_TEXT, voice_model_path,
-            ["saludo_inicial"], robot,
+            ["reverencia"], robot,
         )
     else:
         speak(STARTUP_GREETING_TEXT, voice_model_path)
