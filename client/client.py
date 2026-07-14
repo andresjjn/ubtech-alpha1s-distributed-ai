@@ -126,6 +126,18 @@ STATIC_POSES = {
     "hands_up": [90, 180, 90, 90, 0, 90, 90, 60, 76, 110, 90, 90, 120, 104, 70, 90],
 }
 
+# V4: pose de AGARRE — canales de brazos (0-5) del ultimo frame de
+# abrazar_objeto. play_sequence(arm_override=HOLD_ARMS) re-comanda los
+# brazos a ESTA pose en cada frame del gait: las piernas caminan con la
+# trayectoria ya calibrada y los brazos mantienen el torque de agarre.
+HOLD_ARMS = [0, 0, 75, 180, 177, 115]
+
+# V4: estado global "sosteniendo el cubo". Mientras esta activo se
+# suprime TODO lo que abriria los brazos: idle-rest, verify_posture,
+# gestos conversacionales y las vueltas a init (safe_init_pose preserva
+# los brazos). Salidas seguras unicas: colocar_objeto / soltar_objeto.
+HOLDING = threading.Event()
+
 SEQUENCE_FILES = {
     "mover_adelante":              "mover_adelante.txt",
     "mover_atras":                 "mover_atras.txt",
@@ -354,6 +366,12 @@ def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
         speak(text, voice_model_path)
         return
 
+    # V4: sosteniendo el cubo NO se gesticula (los gestos mueven los
+    # brazos y soltarian el objeto). Solo voz.
+    if HOLDING.is_set():
+        speak(text, voice_model_path)
+        return
+
     wav_path = generate_tts_wav(text, voice_model_path)
     if not wav_path:
         print("[PI] Fallo TTS. Cancelando gestos.")
@@ -491,7 +509,7 @@ def try_streaming_turn(user_text, voice_model, robot, battery_pct=None):
             print("[SYNC] Audio termino antes que los gestos. Stop.")
             gesture_stop.set()
             gthread["t"].join(timeout=3.0)
-    if robot:
+    if robot and not HOLDING.is_set():
         try:
             robot.set_all_servos(STATIC_POSES["init"], speed=50)
             sleep(0.5)
@@ -783,24 +801,35 @@ def load_sequence_from_file(sequence_name):
         return None, "Error parseando '" + file_path + "': " + str(e)
 
 
-def play_sequence(sequence_name, robot, return_to_init=True):
+def play_sequence(sequence_name, robot, return_to_init=True,
+                  arm_override=None):
     """
     Ejecuta una secuencia bloqueante (movimiento completo).
     Usa set_all_servos() — el ACK de cada frame es tolerado porque
     las secuencias no son time-critical como los gestos paralelos.
 
-    return_to_init=False: mantiene la pose del ultimo frame (V3: el robot
+    return_to_init=False: mantiene la pose del ultimo frame (el robot
     debe quedarse abrazando el objeto, no abrir los brazos al terminar).
+
+    arm_override (V4, Fase 3): lista de 6 angulos que SOBRESCRIBE los
+    canales de brazos (0-5) en cada frame. Es el mecanismo de "caminar
+    cargando": el gait de piernas es identico al calibrado y los brazos se
+    re-comandan a la pose de agarre (no se mueven, sostienen el cubo).
     """
     print("[ROBOT] Cargando secuencia '" + sequence_name + "'...")
     frames, error = load_sequence_from_file(sequence_name)
     if error:
         return None, error
 
-    print("[ROBOT] Ejecutando '" + sequence_name + "' (" + str(len(frames)) + " frames)...")
+    print("[ROBOT] Ejecutando '" + sequence_name + "' ("
+          + str(len(frames)) + " frames)"
+          + (" [brazos fijos: agarre]" if arm_override is not None else "")
+          + "...")
     first_frame = True
     for frame in frames:
         angles   = frame["angles"]
+        if arm_override is not None:
+            angles = list(arm_override[:6]) + list(angles[6:])
         time_ms  = frame["time_ms"]
         # V4: el servo se mueve en speed_ms (dato del archivo) y el frame
         # dura time_ms; la diferencia es la fase de asentamiento.
@@ -812,10 +841,32 @@ def play_sequence(sequence_name, robot, return_to_init=True):
         sleep(time_ms / 1000.0)
 
     if return_to_init:
-        robot.set_all_servos(STATIC_POSES["init"], speed=50)
+        if arm_override is not None:
+            # piernas a init; los brazos NO se sueltan
+            target = list(arm_override[:6]) + list(STATIC_POSES["init"][6:])
+        else:
+            target = STATIC_POSES["init"]
+        robot.set_all_servos(target, speed=50)
         sleep(1)
     print("[ROBOT] Secuencia '" + sequence_name + "' finalizada.")
     return "hecho"
+
+
+def safe_init_pose(robot, speed=45):
+    """
+    V4: vuelta a init RESPETANDO el estado HOLDING — si el robot sostiene
+    el cubo, las piernas vuelven a init pero los brazos se quedan en la
+    pose de agarre. Usar SIEMPRE esta funcion (no init directo) en salidas
+    de mision y rutinas automaticas.
+    """
+    if robot is None:
+        return
+    if HOLDING.is_set():
+        pose = HOLD_ARMS + list(STATIC_POSES["init"][6:])
+    else:
+        pose = STATIC_POSES["init"]
+    robot.set_all_servos(pose, speed=speed)
+    sleep(1.0)
 
 
 def _verify_posture(robot, expected=None, settle_s=0.4):
@@ -828,6 +879,9 @@ def _verify_posture(robot, expected=None, settle_s=0.4):
     Devuelve True si la postura es correcta o no se pudo verificar.
     """
     if robot is None:
+        return True
+    # V4: sosteniendo el cubo, la "correccion" a init ABRIRIA los brazos.
+    if HOLDING.is_set():
         return True
     expected = expected if expected is not None else STATIC_POSES["init"]
     try:
@@ -915,6 +969,134 @@ def _listen_for_cancel(cancel_event, stop_event):
                     continue
     except Exception as e:
         print("[MISSION] Listener de cancelacion no disponible: " + str(e))
+
+
+# ---------- V4: MISION PICK & PLACE ----------
+# Ambas cajas usan el MISMO juego de markers (ids 7-10; id 7 al frente,
+# id 8 arriba). El ROL lo decide el estado: en la ida el {7,8} mas cercano
+# es el cubo; cargando, el cubo abrazado desaparece de /vision (ocluido y
+# bajo el rango del estereo) y el unico {7,8} visible es la base.
+MISSION_LABELS = frozenset(("aruco_7", "aruco_8", "aruco_9", "aruco_10"))
+
+Z_HUG        = 0.18   # m: llegada de la ida (marker superior en pos. abrazo)
+Z_PLACE      = 0.24   # m: llegada de la entrega (cubo sobre la base) CALIBRAR
+CARRY_MIN_Z  = 0.25   # m: filtro /vision cargando (marker residual del cubo)
+GRAB_CHECK_Z = 0.35   # m: si un marker sigue a menos de esto, el agarre fallo
+
+
+def _vision_ready():
+    """Preflight: True si /vision responde 200. Sin vision NO se mueve un
+    solo servo (el 503 del proxy distingue 'sin markers' de 'sin camara')."""
+    try:
+        r = requests.get(VISION_URL, timeout=2)
+        return r.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+
+def _get_perception(min_z=None):
+    """GET /vision -> lista de detecciones. min_z activa el filtro de carga
+    en el servicio (elimina el marker residual del cubo abrazado)."""
+    try:
+        url = VISION_URL
+        if min_z:
+            url += "?min_z=" + format(min_z, ".2f")
+        r = requests.get(url, timeout=2)
+        if r.status_code != 200:
+            return []
+        return r.json().get("detections") or []
+    except Exception:
+        return []
+
+
+def _run_leg(robot, cancel_event, carrying, z_arrive, say,
+             target=MISSION_LABELS):
+    """Un tramo de navegacion (ida o entrega) con la misma maquina de
+    estados. carrying=True: gaits con brazos fijos en la pose de agarre y
+    percepcion filtrada por CARRY_MIN_Z."""
+    from mission import FetchMission
+    min_z = CARRY_MIN_Z if carrying else None
+    arms  = HOLD_ARMS if carrying else None
+    m = FetchMission(
+        target,
+        lambda: _get_perception(min_z=min_z),
+        lambda p, init: play_sequence(p, robot, return_to_init=init,
+                                      arm_override=arms),
+        say=say,
+        cancel_event=cancel_event,
+        z_arrive=z_arrive,
+    )
+    result = m.run()
+    print("[MISSION] Tramo " + ("entrega" if carrying else "ida") + ": "
+          + result + " | primitivas: " + str(len(m.log)))
+    return result
+
+
+def _mission_pick(robot, cancel_event, say=None, target=MISSION_LABELS):
+    """Ida + abrazo + verificacion de agarre (1 reintento). Si el agarre es
+    bueno activa HOLDING. Devuelve el texto a hablar."""
+    from mission import grab_check
+    say = say or (lambda t: print("[MISSION] " + t))
+    for intento in (1, 2):
+        result = _run_leg(robot, cancel_event, carrying=False,
+                          z_arrive=Z_HUG, say=say, target=target)
+        if result != "arrived":
+            safe_init_pose(robot)
+            if result == "cancelled":
+                return "Misión cancelada."
+            if result == "not_found":
+                return "No encuentro el cubo."
+            return "Detuve la búsqueda por seguridad."
+        play_sequence("abrazar_objeto", robot, return_to_init=False)
+        sleep(0.8)
+        # Verificacion de agarre: abrazado, el cubo desaparece de /vision;
+        # si un marker sigue a nivel de piso enfrente, se quedo alli.
+        if grab_check(_get_perception(), MISSION_LABELS, z_max=GRAB_CHECK_Z):
+            HOLDING.set()
+            print("[HOLDING] Cubo asegurado. Rutinas de brazos suprimidas.")
+            return "Cubo asegurado."
+        print("[MISSION] Agarre fallido: el cubo sigue enfrente."
+              + (" Reintento." if intento == 1 else ""))
+        play_sequence("soltar_objeto", robot, return_to_init=True)
+    safe_init_pose(robot)
+    return "No pude asegurar el cubo. Revisa su posición."
+
+
+def _mission_deliver(robot, cancel_event, say=None):
+    """Entrega cargando + colocacion + retirada + verificacion post-place.
+    Toda salida sin exito DEPOSITA el cubo (jamas init con el cubo en
+    brazos). Devuelve el texto a hablar."""
+    from mission import stacked_place_check
+    say = say or (lambda t: print("[MISSION] " + t))
+    if not HOLDING.is_set():
+        return "No estoy sosteniendo el cubo. Pídeme primero recogerlo."
+
+    result = _run_leg(robot, cancel_event, carrying=True,
+                      z_arrive=Z_PLACE, say=say)
+    if result != "arrived":
+        # Salida segura sosteniendo: bajar el cubo al piso y soltar.
+        play_sequence("soltar_objeto", robot, return_to_init=True)
+        HOLDING.clear()
+        safe_init_pose(robot)
+        if result == "cancelled":
+            return "Misión cancelada. Dejé el cubo en el piso."
+        if result == "not_found":
+            return "No encuentro la caja base. Dejé el cubo en el piso."
+        return "Detuve la misión por seguridad y dejé el cubo en el piso."
+
+    # Colocar: suelta a altura de pie sobre la base y retirarse 2 pasos.
+    play_sequence("colocar_objeto", robot, return_to_init=True)
+    HOLDING.clear()
+    play_sequence("paso_atras", robot, return_to_init=False)
+    play_sequence("paso_atras", robot, return_to_init=False)
+    sleep(0.8)
+    safe_init_pose(robot)
+
+    # Verificacion post-place (plan §3.3): dos id 7 apilados = cubo encima.
+    if stacked_place_check(_get_perception()):
+        return "Misión cumplida: el cubo quedó sobre la caja."
+    print("[MISSION] Verificacion post-place no concluyente.")
+    return "Coloqué el cubo, pero no puedo confirmar que quedó encima."
 
 
 # ---------- DESPACHADOR ----------
@@ -1065,23 +1247,31 @@ def handle_robot_action(action_json, robot, battery_pct=None):
                 return resp, None, None
             return None, None, "Estado invalido para LEDs."
 
-        # V3: mision de servovision — buscar el objetivo, caminar hasta el
-        # y asegurarlo. Lazo cerrado: GET /vision -> primitiva -> re-percibir.
-        # Cancelable por voz: di "cancela" / "alto" durante la mision.
+        # V4: mision de servovision — pick & place (plan §3.3).
+        # Lazo cerrado: GET /vision -> primitiva -> re-percibir.
+        # Cancelable por voz en todo el trayecto ("cancela" / "alto");
+        # cancelar SOSTENIENDO deposita el cubo, jamas abre brazos a init.
         if action_type == "fetch_object":
-            target = parameters.get("target") or target or "aruco"
-            print("[MISSION] Objetivo: '" + target + "'")
+            mission_target = (parameters.get("target") or target
+                              or "mision_completa")
+            print("[MISSION] Mision: '" + str(mission_target) + "'")
             try:
-                from mission import FetchMission
+                import mission as _mission_mod   # noqa: F401 (valida import)
             except Exception as e:
                 return None, None, "mission.py no disponible: " + str(e)
 
-            def _get_perception():
+            # Preflight (Fase 1): sin vision no se mueve NI un servo.
+            if not _vision_ready():
+                return ("No tengo visión en este momento. Revisa la cámara "
+                        "y el servicio de visión."), None, None
+
+            # Hito 1: anunciar ANTES de moverse (el response del LLM).
+            announce = action_data.get("response")
+            if announce:
                 try:
-                    r = requests.get(VISION_URL, timeout=2)
-                    return r.json().get("detections") or []
-                except Exception:
-                    return []
+                    speak(announce, VOICE_MODEL_PATH)
+                except Exception as e:
+                    print("[MISSION] TTS de anuncio fallo: " + str(e))
 
             cancel_event  = threading.Event()
             stop_listener = threading.Event()
@@ -1092,47 +1282,33 @@ def handle_robot_action(action_json, robot, battery_pct=None):
             ).start()
 
             _mark("t7_usb_command_sent")
-            m = FetchMission(
-                target,
-                _get_perception,
-                # init=False encadena pasos de una rafaga sin volver a INIT
-                lambda p, init=True: play_sequence(p, robot,
-                                                   return_to_init=init),
-                say=lambda t: print("[MISSION] " + t),
-                cancel_event=cancel_event,
-            )
             try:
-                result = m.run()
+                if mission_target == "recoger_cubo":
+                    msg = _mission_pick(robot, cancel_event)
+                elif mission_target == "entregar_cubo":
+                    msg = _mission_deliver(robot, cancel_event)
+                elif mission_target == "mision_completa":
+                    msg = _mission_pick(robot, cancel_event)
+                    if HOLDING.is_set() and not cancel_event.is_set():
+                        # Hito 2: pick logrado -> anunciar el tramo de entrega.
+                        try:
+                            speak("Lo tengo. Voy a la caja.", VOICE_MODEL_PATH)
+                        except Exception:
+                            pass
+                        msg = _mission_deliver(robot, cancel_event)
+                else:
+                    # Legacy/manual: label o prefijo ArUco directo
+                    # ("aruco", "aruco_8"...) -> solo tramo de ida + abrazo.
+                    msg = _mission_pick(robot, cancel_event,
+                                        target=str(mission_target))
             except OSError as e:
                 # USB del robot perdido a mitad de secuencia (Errno 5/19):
                 # abortar limpio en vez de dejar el listener colgado.
                 print("[MISSION] USB perdido durante la mision: " + str(e))
-                return "Perdi la conexion con el robot.", None, None
+                return "Perdí la conexión con el robot.", None, None
             finally:
                 stop_listener.set()
-            print("[MISSION] Resultado: " + result
-                  + " | primitivas: " + str(len(m.log)))
-
-            # V4: la mision ya no rebota a init por primitiva; en TODA
-            # salida sin exito hay que reponer la postura aqui.
-            if result != "arrived":
-                try:
-                    robot.set_all_servos(STATIC_POSES["init"], speed=45)
-                    sleep(1.0)
-                except OSError:
-                    pass
-
-            if result == "arrived":
-                if "abrazar_objeto" in SEQUENCE_FILES:
-                    # return_to_init=False: queda erguido sosteniendo el objeto
-                    play_sequence("abrazar_objeto", robot, return_to_init=False)
-                    return "Objeto asegurado.", None, None
-                return "He llegado al objeto.", None, None
-            if result == "cancelled":
-                return "Misión cancelada.", None, None
-            if result == "not_found":
-                return "No encuentro el objeto.", None, None
-            return "Detuve la busqueda por seguridad.", None, None
+            return msg, None, None
 
         return None, None, "Accion '" + str(action_type) + "' no reconocida."
 
@@ -1226,7 +1402,9 @@ def main():
         rest_state["resting"] = True
         print("[IDLE] Sin interaccion; entrando en reposo.")
         led.set("off")
-        if robot:
+        # V4: sosteniendo el cubo NO se mueve nada (init soltaria el cubo);
+        # el reposo es solo visual (LED).
+        if robot and not HOLDING.is_set():
             try:
                 robot.set_all_servos(STATIC_POSES["init"], speed=30)
             except OSError:
