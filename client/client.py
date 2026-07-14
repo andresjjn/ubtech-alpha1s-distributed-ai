@@ -745,7 +745,14 @@ def query_llm_server(text, battery_pct=None):
 def _load_frames_from_file(file_path):
     """
     Lector generico para archivos de secuencia/gesto.
-    Formato por linea:  [angulos x 16] + [velocidad, tiempo_ms]
+    Formato por linea:  [angulos x 16] + [velocidad_ms, tiempo_ms]
+
+    V4 (Fase 2): conserva la velocidad del archivo. El formato original
+    separa el tiempo de MOVIMIENTO (velocidad_ms: el servo interpola en ese
+    tiempo) del tiempo del FRAME (tiempo_ms: cuanto dura el frame completo,
+    movimiento + asentamiento). El V3 descartaba la velocidad y usaba
+    tiempo_ms para ambas cosas: los frames cortos se volvian sacudidas y
+    los ajustes finos perdian su fase de asentamiento.
     """
     frames = []
     with open(file_path, "r") as f:
@@ -756,8 +763,10 @@ def _load_frames_from_file(file_path):
             parts     = line.split(" + ")
             angles    = ast.literal_eval(parts[0])
             time_data = ast.literal_eval(parts[1])
-            time_ms   = time_data[1]
-            frames.append({"angles": angles, "time_ms": time_ms})
+            time_ms   = time_data[1] if len(time_data) > 1 else time_data[0]
+            speed_ms  = time_data[0]
+            frames.append({"angles": angles, "speed_ms": speed_ms,
+                           "time_ms": time_ms})
     return frames
 
 
@@ -793,7 +802,9 @@ def play_sequence(sequence_name, robot, return_to_init=True):
     for frame in frames:
         angles   = frame["angles"]
         time_ms  = frame["time_ms"]
-        speed    = max(1, int(time_ms / 20))
+        # V4: el servo se mueve en speed_ms (dato del archivo) y el frame
+        # dura time_ms; la diferencia es la fase de asentamiento.
+        speed    = max(1, int(frame.get("speed_ms", time_ms) / 20))
         if first_frame:
             _mark("t7_usb_command_sent")
             first_frame = False
@@ -864,7 +875,8 @@ def play_gesture(gesture_name, robot, stop_event=None):
             break   # corte limpio por frame
         angles  = frame["angles"]
         time_ms = frame["time_ms"]
-        speed   = max(1, int(time_ms / 20))
+        # V4: mover en speed_ms del archivo, sostener hasta time_ms.
+        speed   = max(1, int(frame.get("speed_ms", time_ms) / 20))
         # _send_no_reply: envia el paquete HID sin esperar respuesta.
         # Reduce la latencia de cada frame de ~20ms a <2ms.
         pkt = robot._build_packet(0x23, list(angles) + [speed, 20])
@@ -1101,6 +1113,15 @@ def handle_robot_action(action_json, robot, battery_pct=None):
             print("[MISSION] Resultado: " + result
                   + " | primitivas: " + str(len(m.log)))
 
+            # V4: la mision ya no rebota a init por primitiva; en TODA
+            # salida sin exito hay que reponer la postura aqui.
+            if result != "arrived":
+                try:
+                    robot.set_all_servos(STATIC_POSES["init"], speed=45)
+                    sleep(1.0)
+                except OSError:
+                    pass
+
             if result == "arrived":
                 if "abrazar_objeto" in SEQUENCE_FILES:
                     # return_to_init=False: queda erguido sosteniendo el objeto
@@ -1108,12 +1129,6 @@ def handle_robot_action(action_json, robot, battery_pct=None):
                     return "Objeto asegurado.", None, None
                 return "He llegado al objeto.", None, None
             if result == "cancelled":
-                # un cancel a mitad de rafaga deja al robot en postura de
-                # marcha: restaurar INIT antes de quedarse quieto
-                try:
-                    robot.set_all_servos(STATIC_POSES["init"], speed=50)
-                except OSError:
-                    pass
                 return "Misión cancelada.", None, None
             if result == "not_found":
                 return "No encuentro el objeto.", None, None
