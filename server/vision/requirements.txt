@@ -1,0 +1,4 @@
+depthai>=3,<4
+opencv-contrib-python>=4.7
+flask>=2
+numpy

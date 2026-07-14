@@ -29,7 +29,11 @@ v2 -> v3: se añadió "targets" (lista) para encadenar varias secuencias.
 CONTRACT_VERSION = "v3.1"
 
 # ── Configuración LLM ─────────────────────────────────────────────────────────
-LLM_API_BASE_URL = "http://localhost:1234/v1"
+# V4: sobreescribible por entorno — dentro del contenedor Docker, LM Studio
+# vive en el HOST (GPU): LLM_API_BASE_URL=http://host.docker.internal:1234/v1
+import os
+LLM_API_BASE_URL = os.environ.get("LLM_API_BASE_URL",
+                                  "http://localhost:1234/v1")
 # ⚠️  Verificar string exacto en LM Studio → Models. Distingue mayúsculas.
 # OJO: "qwen2.5-7b-instruct" (sin -vl) NO existe en este LM Studio; las
 # peticiones con nombre desconocido caían en el modelo que estuviera cargado.

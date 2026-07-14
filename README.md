@@ -259,7 +259,34 @@ python vision_service.py             # operación normal en :3001
 python vision_service.py --fake escena_ejemplo.json   # sin cámara (pruebas)
 ```
 
-Si la OAK-D va en **otra** máquina que el ROG, apunta el proxy: `set VISION_BACKEND=http://IP_DE_LA_MAC:3001/vision` antes de arrancar `server.py`. Con `--debug`, verifica: (1) que detecta los markers del cubo (si no, prueba `--dict 5X5_50`…), (2) que `z` coincide con la cinta métrica ±3 cm, (3) que `x` es positivo cuando el cubo está a la DERECHA de la cámara (si sale invertido, pon `SWAP_SIDES=True` en `mission.py`).
+Si la OAK-D va en **otra** máquina que el ROG, apunta el proxy: `set VISION_BACKEND=http://IP_DE_LA_MAC:3001/vision` antes de arrancar `server.py`. Con `--debug`, verifica: (1) que detecta los markers del cubo (si no, prueba `--dict 5X5_50`…), (2) que `z` coincide con la cinta métrica ±3 cm, (3) que `x` es positivo cuando el cubo está a la DERECHA de la cámara (si sale invertido, pon `SWAP_SIDES=True` en `mission.py`). Sin pantalla, usa **`GET /snapshot`** (JPEG anotado) para ver lo que ve la cámara en remoto.
+
+### Contenedores ROS 2 (V4)
+
+Los servicios del host corren en contenedores basados en `ros:humble` — el **mismo stack en la MacBook y en el ROG** (`docker/`):
+
+| Servicio | Imagen | Mac | ROG / Linux |
+|---|---|---|---|
+| `server` (:3000, LLM gateway + STT) | `alpha1s/server` | ✅ contenedor | ✅ contenedor |
+| `vision` (:3001, OAK-D + ArUco) | `alpha1s/vision` | ⚠️ **nativo** (`run_native.sh`) | ✅ contenedor (perfil `linux-usb`) |
+| LM Studio (GPU) | — | nativo | nativo (el contenedor lo alcanza vía `host.docker.internal:1234`) |
+
+```bash
+# MacBook (OAK-D en la Mac): visión nativa + server en contenedor
+server/vision/run_native.sh &
+docker compose -f docker/docker-compose.yml up -d server
+
+# ROG / Linux con la OAK-D (WSL2: attach previo con usbipd)
+VISION_BACKEND=http://vision:3001/vision \
+  docker compose -f docker/docker-compose.yml --profile linux-usb up -d
+
+# Smoke test sin cámara ni LM Studio (STT pequeño)
+STT_MODEL=tiny docker compose -f docker/docker-compose.yml up -d server
+```
+
+> ⚠️ **Limitación dura de macOS:** Docker Desktop no pasa dispositivos USB al contenedor, así que el servicio de visión corre **nativo** en la Mac (misma API HTTP → transparente para el resto del stack). En Linux/WSL2 sí va contenedorizado (`privileged` + `/dev/bus/usb`). Dentro del contenedor ROS, el servicio además **publica las detecciones en el topic `/alpha1s/detections`** (rclpy, `std_msgs/String` con el JSON).
+
+El modelo STT se descarga una sola vez al volumen `whisper-cache`. Config por entorno: `LLM_API_BASE_URL`, `VISION_BACKEND`, `STT_MODEL`.
 
 #### Deploy desde el repo (v2)
 

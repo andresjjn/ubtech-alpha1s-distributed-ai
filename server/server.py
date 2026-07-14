@@ -45,7 +45,9 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-STT_MODEL   = "large-v3-turbo"
+# V4: sobreescribible por entorno (STT_MODEL=tiny para smoke tests sin
+# bajar el modelo grande; el contenedor cachea el modelo en un volumen).
+STT_MODEL   = os.environ.get("STT_MODEL", "large-v3-turbo")
 STT_DEVICE  = "cpu"
 STT_COMPUTE = "int8"
 
