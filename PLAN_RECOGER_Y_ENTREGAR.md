@@ -27,7 +27,7 @@ Evidencia recogida en vivo (Mac + SSH lectura a la Pi + HTTP al ROG):
 | `alpha1s_prompt.py` Pi | del 27-may (pre-contrato) — skew de despliegue |
 | Secuencias de misión en la Pi | `abrazar_objeto, soltar_objeto, paso_adelante, paso_derecha, paso_izquierda` existen en la Pi pero **NO en el repo** |
 | `paso_atras.txt` | mapeado en `SEQUENCE_FILES` (client.py:145) pero **no existe** ni en la Pi ni en el repo |
-| `host_camera.py` | **nunca se commiteó** — solo vive en el ROG (`git log --all` vacío) |
+| `host_camera.py` | **nunca se commiteó** y el usuario no lo encuentra en el ROG ni en la Mac — **se da por perdido**: el servicio de visión se reescribe (Fase 0) |
 
 Conclusión: **hoy la misión no puede ejecutarse end-to-end con el stack v3
 desplegado**. Cuando "funciona" es porque se prueba con el server/cliente
@@ -47,8 +47,12 @@ primera clase.
   devuelve 404 → `_get_perception()` retorna `[]` siempre → la misión hace 18
   `girar_a_la_derecha` (justo el movimiento con riesgo de caída documentado) y
   termina `not_found`.
-- **A3. `host_camera.py` fuera del repo.** El servicio de percepción (cámara +
-  ArUco + xyz en metros) no está versionado; no se puede corregir ni auditar.
+- **A3. `host_camera.py` perdido.** El servicio de percepción (cámara + ArUco
+  + xyz en metros) nunca se versionó y ya no aparece en ninguna máquina
+  (confirmado 13-jul). La interfaz a reimplementar está definida por
+  mission.py/client.py: `GET /vision` →
+  `{"detections":[{"label":"aruco_<id>","xyz_m":[x,y,z]}]}` con
+  x = + derecha de la cámara, z = distancia frontal, en metros.
 - **A4. 5 secuencias de misión fuera del repo** (solo en la Pi) y
   **`paso_atras` es un mapping muerto** (si algo lo invoca → error de archivo).
 - **A5. Skew de despliegue Pi↔ROG.** La Pi corre el client pre-v2; el check
@@ -142,12 +146,32 @@ FetchMission(target="aruco_8",  z_arrive=0.18, ...)            # tramo ida
 FetchMission(target="aruco_5",  z_arrive=Z_PLACE, arm_override=HOLD_ARMS, ...)  # tramo entrega
 ```
 
-- `target` por **ID exacto** (el prefijo-match actual ya soporta `aruco_8`);
-  la convención `aruco_<id>` la define host_camera.py.
+- `target` por **conjunto de IDs por rol** (ya no el prefijo genérico
+  "aruco"): `CUBE_IDS = {7, 8, 9, 10}` — las 4 caras laterales del cubo
+  impreso — y `DEST_IDS = {…}` (a definir al imprimir el juego del destino,
+  propuesta: 20-23). `_find_target` recibe el conjunto y elige la detección
+  más cercana DEL conjunto: el cubo se reconoce desde cualquier lado y jamás
+  se confunde con el destino.
 - El tramo de entrega navega con `arm_override` activo en TODAS las
   primitivas y umbrales propios (`Z_PLACE`, `X_ARRIVE` más estricto).
-- La caja destino es más alta que el cubo → sus markers (frontal y tapa)
-  quedan visibles por encima del cubo abrazado. Validar FOV en hardware.
+- La caja destino es más alta que el cubo → sus markers quedan visibles por
+  encima del cubo abrazado. Validar FOV en hardware.
+
+**Consecuencia del cubo nuevo — la TAPA ya no tiene marcador** (el PDF
+`cubo_armable_10cm_A4.pdf` imprime ids solo en las 4 caras laterales; tapa y
+base en blanco): la llegada actual dependía de leer la tapa a `Z_ARRIVE=0.18`.
+Dos opciones — se recomienda a + b como fallback:
+
+  a) Pegar un marker extra (id 11, mismo diccionario, ~7 cm) en la tapa del
+     cubo → restaura la guía de cerca ya probada en hardware. Barato.
+  b) **Aproximación ciega calibrada:** al perder el marker frontal en zona
+     fina, tomar la última z conocida y avanzar
+     `ceil((z_ult − Z_HUG)/STEP_M)` pasos sin visión, re-verificar y abrazar.
+     Necesaria de todos modos (la tapa también sale del FOV en el último
+     tramo) y depende de STEP_M calibrado (Fase 2.5).
+
+El mismo tratamiento aplica a la colocación: el marker frontal del destino
+sale del FOV en el tramo final si la caja es baja.
 
 ### 3.3 Flujo completo `pick_and_place`
 
@@ -180,25 +204,45 @@ SOSTENIENDO: bajar el cubo al piso con `soltar_objeto` (nunca init directo).
 
 ## 4. Fases de ejecución
 
-### Fase 0 — Rescate y fuente única (sin tocar comportamiento)
-1. Copiar del ROG al repo: `host_camera.py` (o como se llame el servicio de
-   visión) + `rog_server_fase4.py` como referencia → `server/vision/`.
-   **[requiere al usuario — no hay SSH al ROG]**
-2. Commitear las 5 secuencias de misión desde la Pi a `client/sequences/`
+### Fase 0 — Fuente única + reescritura del servicio de visión
+
+`host_camera.py` está perdido (no aparece en el ROG ni en la Mac): el
+servicio de percepción se REESCRIBE y esta vez queda versionado en el repo.
+
+1. **`server/vision/vision_service.py` (nuevo).** OAK-D montada en el robot,
+   USB a la máquina host (ROG **o** MacBook — debe correr en ambas):
+   - depthai: ColorCamera + StereoDepth alineado al color.
+   - cv2.aruco sobre el frame de color. Diccionario: aparenta 4x4 —
+     **confirmarlo decodificando el propio PDF del cubo** antes de fijar la
+     constante (un one-liner con cv2 en la máquina de visión).
+   - xyz por profundidad estéreo en el centro del marker (mediana de ROI
+     5x5), convención de mission.py: x = + derecha de la cámara,
+     z = distancia frontal, en metros.
+   - `GET /vision` → `{"detections":[{"label":"aruco_7","xyz_m":[x,y,z],
+     "confidence":0.9}]}` (Flask, puerto 3001).
+   - **Modo debug con ventana** (overlay de ejes y distancias) para validar
+     orientación y escala ANTES de mover el robot — aquí se detecta el
+     `SWAP_SIDES` de una sola vez.
+2. **Proxy en `server/server.py`:** `GET /vision` reenvía a `VISION_BACKEND`
+   (default `http://localhost:3001/vision`). El cliente sigue apuntando a
+   `ROG:3000/vision` sin importar dónde esté enchufada la OAK-D; si la cámara
+   va a la Mac, solo cambia `VISION_BACKEND` en el ROG.
+3. Commitear las 5 secuencias de misión desde la Pi a `client/sequences/`
    (`abrazar_objeto, soltar_objeto, paso_adelante, paso_derecha,
    paso_izquierda`) — contenido ya auditado por SSH.
-3. Crear `paso_atras.txt` (espejo temporal de `paso_adelante` invertido o
+4. Crear `paso_atras.txt` (espejo temporal de `paso_adelante` invertido o
    captura nueva) o retirar el mapping muerto hasta tenerlo.
-4. Documentar en README: topología de cámara (¿OAK-D/webcam, conectada a qué
-   máquina?), IDs ArUco por rol, alturas de cubo y caja destino.
-5. **Criterio de salida:** repo == Pi == ROG (deploy_pi.sh --apply + copia
-   manual al ROG); `python3 client/mission.py` verde.
+5. Documentar en README: topología (OAK-D en el robot → USB al host), IDs por
+   rol (cubo 7-10; destino por definir), geometría (cubo 10 cm, marker ~7 cm).
+6. **Criterio de salida:** repo == Pi == ROG; `python3 client/mission.py`
+   verde; `curl :3000/vision` devuelve el cubo real con z coherente (±3 cm
+   contra cinta métrica) y x con el signo correcto a ambos lados.
 
 ### Fase 1 — Reintegrar la misión al contrato (v3.1)
 1. `alpha1s_prompt.py`: action `fetch_object`, targets de misión, prompt y
    ejemplos (§3.4). Sincronizar copia client/ (deben ser `diff`-idénticos).
-2. `server/server.py`: endpoint `/vision` (proxy o integración del servicio de
-   cámara rescatado en Fase 0); `/health` reporta `vision: ok|down`.
+2. `server/server.py`: `/health` reporta `vision: ok|down` (el proxy
+   `/vision` ya quedó montado en Fase 0).
 3. `client.py`: mapear targets de misión → IDs ArUco; rechazar misión si
    `/vision` no responde ANTES de mover un servo (hoy caminaría a ciegas).
 4. Validación en vivo LM Studio: lote fetch/deliver/completa/negativos.
@@ -272,22 +316,33 @@ independientes entre sí tras la 1 (paralelizables).
 
 ---
 
-## 5. Preguntas abiertas (responder antes/durante Fase 0)
+## 5. Preguntas — respondidas y pendientes
 
-1. **¿Dónde está conectada la cámara y cuál es?** (¿OAK-D en el robot →
-   procesa la Pi? ¿webcam USB al ROG? — la convención xyz viene de
-   host_camera.py que solo está en el ROG). Copiar ese archivo al repo es el
-   primer paso de todo.
-2. **IDs ArUco:** ¿qué IDs tienen hoy el cubo (frontal y tapa) y cuáles
-   pondremos a la caja destino? ¿Tamaño físico de los markers (afecta el
-   rango de detección)?
-3. **Geometría de la entrega:** altura de la caja destino vs altura a la que
-   queda el cubo abrazado (idealmente tapa destino ≈ base del cubo cargado,
-   así "colocar" es solo abrir los brazos).
-4. **¿El destino está siempre en el mismo rumbo que la ida** (navegación
-   lineal pura, sin giros cargando)? El plan asume que sí, como describes
-   ("otra caja que está más adelante"). Si puede requerir giros cargando, hay
-   que validar `girar_*` con arm_override en la Fase 3 (riesgo alto).
+**Respondidas (13-jul-2026):**
+
+1. **Cámara:** OAK-D montada **en el robot**, USB a la ROG **o a la MacBook**
+   (el servicio de visión debe poder correr en ambas — de ahí el proxy de
+   Fase 0.2). `host_camera.py` no aparece en ninguna máquina → **perdido**,
+   se reescribe en Fase 0.
+2. **Markers del cubo** (PDF `cubo_armable_10cm_A4.pdf`): cubo de **10 cm**,
+   caras laterales 1-4 → **aruco ids 7, 8, 9, 10** (marker impreso ~7 cm,
+   diccionario aparenta 4x4 — confirmar en Fase 0.1). **Tapa y base SIN
+   marcador** → cambia la llegada fina, ver §3.2.
+
+**Pendientes:**
+
+3. **Markers de la caja destino:** imprimir juego propio (propuesta: ids
+   20-23 laterales, mismo diccionario, tamaño igual o mayor). ¿Dimensiones
+   de la caja destino?
+4. **Geometría de la entrega:** altura de la caja destino vs altura a la que
+   queda el cubo abrazado (ideal: tapa destino ≈ base del cubo cargado, así
+   "colocar" es solo abrir los brazos).
+5. **¿El destino queda siempre en el mismo rumbo que la ida** (navegación
+   lineal pura, sin giros cargando)? El plan asume que sí ("otra caja que
+   está más adelante"). Si puede requerir giros cargando, hay que validar
+   `girar_*` con arm_override en la Fase 3 (riesgo alto).
+6. **Decisión tapa del cubo:** ¿pegamos marker id 11 en la tapa (opción a,
+   recomendada, restaura la guía probada) o solo aproximación ciega (b)?
 
 ---
 
@@ -299,4 +354,5 @@ independientes entre sí tras la 1 (paralelizables).
 | El cubo abrazado tapa el FOV bajo de la cámara | destino más alto que el cubo; validar FOV al inicio de Fase 4; si falla, marker destino más grande/alto |
 | Respetar `speed` cambia la dinámica de gaits ya calibrados | Fase 2.3 re-prueba los 3 gaits aislados antes de usarlos en misión |
 | Deriva de yaw acumulada en trayectos largos | laterales de a 1 + re-percepción; IMU como opcional 2.6 |
-| host_camera.py irrescatable | reescribir sobre cv2.aruco + estimatePoseSingleMarkers (webcam) o depthai (OAK-D); la interfaz `/vision` {label, xyz_m} ya está definida por mission.py |
+| Diccionario/escala ArUco mal asumidos en el servicio nuevo | confirmar el diccionario decodificando el PDF con cv2.aruco; validar z contra cinta métrica y el signo de x en el modo debug (Fase 0.6) |
+| Llegada fina sin marker en la tapa del cubo | opción a (marker id 11 en la tapa) + fallback de aproximación ciega calibrada (§3.2) |
