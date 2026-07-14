@@ -142,36 +142,46 @@ Riesgo físico: brazos al frente + cubo desplazan el CoG hacia adelante. El
 Generalizarla con parámetros en vez de duplicarla:
 
 ```
-FetchMission(target="aruco_8",  z_arrive=0.18, ...)            # tramo ida
-FetchMission(target="aruco_5",  z_arrive=Z_PLACE, arm_override=HOLD_ARMS, ...)  # tramo entrega
+FetchMission(targets={"aruco_7","aruco_8"}, z_arrive=Z_HUG, ...)   # ida: el {7,8} MÁS CERCANO es el cubo
+FetchMission(targets={"aruco_7","aruco_8"}, z_arrive=Z_PLACE,      # entrega: el ÚNICO {7,8} visible es la base
+             arm_override=HOLD_ARMS, ...)
 ```
 
-- `target` por **conjunto de IDs por rol** (ya no el prefijo genérico
-  "aruco"): `CUBE_IDS = {7, 8, 9, 10}` — las 4 caras laterales del cubo
-  impreso — y `DEST_IDS = {…}` (a definir al imprimir el juego del destino,
-  propuesta: 20-23). `_find_target` recibe el conjunto y elige la detección
-  más cercana DEL conjunto: el cubo se reconoce desde cualquier lado y jamás
-  se confunde con el destino.
+**Convención de markers (decisión del usuario, 13-jul): ambas cajas usan el
+MISMO juego impreso (ids 7-10), orientadas igual — cara 1 (id 7) AL FRENTE,
+cara 2 (id 8) ARRIBA.** Geometría resultante al orientar así el armable
+(rotación de 90° del anillo 1-2-3-4): frente = id 7, arriba = id 8,
+atrás = id 9, abajo = id 10, y los DOS COSTADOS quedan en blanco (eran la
+tapa/base sin marcador). Consecuencias:
+
+- **La guía de cerca queda restaurada gratis:** el marker superior (id 8)
+  cumple el papel que antes tenía la tapa (`Z_ARRIVE` se lee de él en
+  posición de abrazo). No hay que imprimir nada nuevo.
+- **Cubo y base NO se distinguen por ID** → la desambiguación es por ESTADO
+  de la misión + orden de profundidad (el layout es lineal: cubo primero,
+  base más adelante):
+  - Ida: objetivo = la detección {7,8} **más cercana** (el cubo).
+  - Cargando: el cubo abrazado queda ocluido por los brazos y por debajo del
+    rango mínimo del estéreo (~20 cm) → desaparece de `/vision`; el único
+    {7,8} restante es la base. Objetivo = esa.
+  - Colocación fina: el id 8 de la base (su cara superior) define `Z_PLACE`.
+- Aproximación desde un COSTADO en blanco no ve marker: aceptable porque el
+  layout es controlado y frontal; la búsqueda por giro sigue siendo el
+  último recurso.
+- **Blindaje obligatorio en el servicio de visión:** descartar detecciones
+  sin profundidad estéreo válida, y durante la carga ignorar z < 0.25 m —
+  así un marker residual del cubo abrazado jamás contamina la navegación.
+  Verificar en hardware (Fase 3) que el cubo cargado realmente desaparece.
+- **Aproximación ciega calibrada como fallback** (se implementa igual): si
+  se pierde toda referencia en zona fina, tomar la última z conocida y
+  avanzar `ceil((z_ult − Z_HUG)/STEP_M)` pasos sin visión, re-verificar y
+  abrazar. Depende de STEP_M calibrado (Fase 2.5).
 - El tramo de entrega navega con `arm_override` activo en TODAS las
   primitivas y umbrales propios (`Z_PLACE`, `X_ARRIVE` más estricto).
-- La caja destino es más alta que el cubo → sus markers quedan visibles por
-  encima del cubo abrazado. Validar FOV en hardware.
-
-**Consecuencia del cubo nuevo — la TAPA ya no tiene marcador** (el PDF
-`cubo_armable_10cm_A4.pdf` imprime ids solo en las 4 caras laterales; tapa y
-base en blanco): la llegada actual dependía de leer la tapa a `Z_ARRIVE=0.18`.
-Dos opciones — se recomienda a + b como fallback:
-
-  a) Pegar un marker extra (id 11, mismo diccionario, ~7 cm) en la tapa del
-     cubo → restaura la guía de cerca ya probada en hardware. Barato.
-  b) **Aproximación ciega calibrada:** al perder el marker frontal en zona
-     fina, tomar la última z conocida y avanzar
-     `ceil((z_ult − Z_HUG)/STEP_M)` pasos sin visión, re-verificar y abrazar.
-     Necesaria de todos modos (la tapa también sale del FOV en el último
-     tramo) y depende de STEP_M calibrado (Fase 2.5).
-
-El mismo tratamiento aplica a la colocación: el marker frontal del destino
-sale del FOV en el tramo final si la caja es baja.
+- Ambas cajas son el cubo armable de 10 cm → la base mide 10 cm de alto; el
+  cubo abrazado viaja aprox. a esa altura. Validar en hardware que la base
+  del cubo cargado LIBRA la cara superior de la base (si roza, la colocación
+  necesita 1-2 cm de inclinación extra en la secuencia).
 
 ### 3.3 Flujo completo `pick_and_place`
 
@@ -183,7 +193,8 @@ LLM: {"action":"fetch_object","target":"mision_completa",...}
  └─ vuelta: FetchMission(destino, arm_override=HOLD_ARMS) → arrived
  └─ place:  colocar_objeto (inclinar + abrir sobre la tapa + soltar)
  └─ retirada: paso_atras x2 → init → HOLDING=False
- └─ verificación final: el marker del cubo se ve a la altura de la tapa → éxito
+ └─ verificación final: DOS id 7 apilados (misma z, alturas separadas ~10 cm)
+    y el id 8 de la base ocluido por el cubo puesto encima → éxito
 ```
 
 Cancelación por voz en todo el trayecto (el listener ya existe). Si se cancela
@@ -232,8 +243,9 @@ servicio de percepción se REESCRIBE y esta vez queda versionado en el repo.
    paso_izquierda`) — contenido ya auditado por SSH.
 4. Crear `paso_atras.txt` (espejo temporal de `paso_adelante` invertido o
    captura nueva) o retirar el mapping muerto hasta tenerlo.
-5. Documentar en README: topología (OAK-D en el robot → USB al host), IDs por
-   rol (cubo 7-10; destino por definir), geometría (cubo 10 cm, marker ~7 cm).
+5. Documentar en README: topología (OAK-D en el robot → USB al host), la
+   convención de markers (mismo juego 7-10 en ambas cajas, id 7 al frente e
+   id 8 arriba, costados en blanco) y geometría (cubo 10 cm, marker ~7 cm).
 6. **Criterio de salida:** repo == Pi == ROG; `python3 client/mission.py`
    verde; `curl :3000/vision` devuelve el cubo real con z coherente (±3 cm
    contra cinta métrica) y x con el signo correcto a ambos lados.
@@ -294,9 +306,10 @@ servicio de percepción se REESCRIBE y esta vez queda versionado en el repo.
 3. Orquestación completa en `handle_robot_action` (§3.3) con narración TTS por
    hitos ("Lo tengo", "Voy a la caja", "Colocado") y cancelación segura
    (cancel sosteniendo → deposita en el piso, nunca init).
-4. Verificación post-place: el marker del cubo visible a altura de tapa (z del
-   cubo ≈ z de la caja, y ~misma x) → "misión cumplida"; si no, 1 reintento de
-   colocación.
+4. Verificación post-place (tras retroceder 2 pasos): DOS detecciones de
+   id 7 apiladas — misma z (±5 cm), alturas separadas ~10 cm — y el id 8 de
+   la base ya NO visible (lo ocluye el cubo puesto encima) → "misión
+   cumplida"; si no, 1 reintento de colocación.
 5. **Criterio:** misión completa por voz ("recoge el cubo y ponlo sobre la
    caja") con éxito 4/5 desde posiciones iniciales distintas.
 
@@ -329,20 +342,21 @@ independientes entre sí tras la 1 (paralelizables).
    diccionario aparenta 4x4 — confirmar en Fase 0.1). **Tapa y base SIN
    marcador** → cambia la llegada fina, ver §3.2.
 
+3. **Markers de la caja destino (13-jul):** NO se imprime juego nuevo —
+   **ambas cajas usan los mismos ids 7-10**, orientadas con la cara 1 (id 7)
+   al frente y la cara 2 (id 8) arriba. Desambiguación por estado de la
+   misión + más-cercano (§3.2).
+4. **Geometría (13-jul, implícita):** la base es el mismo cubo armable →
+   10 cm de alto. Validar en Fase 4 que el cubo cargado libra esa altura.
+5. **Decisión tapa (13-jul):** resuelta por orientación — el id 8 queda
+   arriba sin imprimir nada; la aproximación ciega queda como fallback.
+
 **Pendientes:**
 
-3. **Markers de la caja destino:** imprimir juego propio (propuesta: ids
-   20-23 laterales, mismo diccionario, tamaño igual o mayor). ¿Dimensiones
-   de la caja destino?
-4. **Geometría de la entrega:** altura de la caja destino vs altura a la que
-   queda el cubo abrazado (ideal: tapa destino ≈ base del cubo cargado, así
-   "colocar" es solo abrir los brazos).
-5. **¿El destino queda siempre en el mismo rumbo que la ida** (navegación
+6. **¿El destino queda siempre en el mismo rumbo que la ida** (navegación
    lineal pura, sin giros cargando)? El plan asume que sí ("otra caja que
    está más adelante"). Si puede requerir giros cargando, hay que validar
    `girar_*` con arm_override en la Fase 3 (riesgo alto).
-6. **Decisión tapa del cubo:** ¿pegamos marker id 11 en la tapa (opción a,
-   recomendada, restaura la guía probada) o solo aproximación ciega (b)?
 
 ---
 
@@ -351,8 +365,9 @@ independientes entre sí tras la 1 (paralelizables).
 | Riesgo | Mitigación |
 |---|---|
 | Balance cargando (CoG adelantado) | protocolo incremental Fase 3.4; abortar a `soltar_objeto` ante duda |
-| El cubo abrazado tapa el FOV bajo de la cámara | destino más alto que el cubo; validar FOV al inicio de Fase 4; si falla, marker destino más grande/alto |
+| El cubo abrazado tapa el FOV bajo de la cámara | validar FOV cargado al inicio de Fase 4; si la base no se ve, ajustar inclinación de la montura OAK-D o retroceder para re-adquirir (lógica existente) |
+| Ids compartidos cubo/base (7-10 en ambas cajas) | desambiguación por estado + más-cercano (layout lineal documentado); blindaje en visión: descartar detecciones sin profundidad válida e ignorar z < 0.25 m durante la carga |
 | Respetar `speed` cambia la dinámica de gaits ya calibrados | Fase 2.3 re-prueba los 3 gaits aislados antes de usarlos en misión |
 | Deriva de yaw acumulada en trayectos largos | laterales de a 1 + re-percepción; IMU como opcional 2.6 |
 | Diccionario/escala ArUco mal asumidos en el servicio nuevo | confirmar el diccionario decodificando el PDF con cv2.aruco; validar z contra cinta métrica y el signo de x en el modo debug (Fase 0.6) |
-| Llegada fina sin marker en la tapa del cubo | opción a (marker id 11 en la tapa) + fallback de aproximación ciega calibrada (§3.2) |
+| El marker del cubo cargado sigue siendo detectable de cerca | verificar en Fase 3; el filtro de profundidad/z del servicio de visión lo elimina de `/vision` antes de que contamine la navegación |
