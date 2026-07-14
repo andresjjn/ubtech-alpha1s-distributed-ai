@@ -10,10 +10,14 @@ Endpoints:
   POST /transcribe   → multipart audio → {"text": "..."}
   POST /query        → {text} → {"response": "<json_string>"}   (no-stream, autoritativo)
   POST /query_stream → {text} → SSE de deltas del JSON           (Fase 4, baja latencia)
+  GET  /vision       → proxy al servicio de vision (V4, VISION_BACKEND)
 
 Fase 4: streaming SSE. El cliente Pi extrae "response" token por token y
         alimenta Piper por frases; gesture_sequence se procesa al final.
         /query queda como fallback robusto si el streaming falla.
+V4: /vision hace proxy a vision_service.py (OAK-D + ArUco). La camara puede
+    estar enchufada a esta maquina o a otra: solo cambia VISION_BACKEND
+    (env var o el default localhost:3001). El cliente Pi siempre apunta aqui.
 """
 
 import sys
@@ -21,6 +25,8 @@ import json
 import os
 import tempfile
 import logging
+import urllib.request
+import urllib.error
 
 # Windows: UTF-8 en stdout/stderr (evita mojibake de acentos en logs)
 sys.stdout.reconfigure(encoding='utf-8')
@@ -42,6 +48,12 @@ log = logging.getLogger(__name__)
 STT_MODEL   = "large-v3-turbo"
 STT_DEVICE  = "cpu"
 STT_COMPUTE = "int8"
+
+# V4: backend del servicio de vision (vision_service.py). Si la OAK-D esta
+# enchufada a OTRA maquina (p.ej. la MacBook), apuntar aqui su IP:
+#   set VISION_BACKEND=http://192.168.1.X:3001/vision   (Windows)
+VISION_BACKEND = os.environ.get("VISION_BACKEND",
+                                "http://localhost:3001/vision")
 
 RESPONSE_FORMAT = {"type": "json_schema", "json_schema": ALPHA1S_SCHEMA}
 
@@ -91,7 +103,39 @@ def health():
         "contract": CONTRACT_VERSION,
         "model":    LLM_MODEL,
         "stt":      STT_MODEL,
+        "vision":   _vision_status(),
     })
+
+
+# ── /vision (V4: proxy al servicio de percepcion) ─────────────────────────────
+def _vision_status():
+    """'ok' si el backend de vision responde, 'down' si no."""
+    try:
+        req = urllib.request.Request(VISION_BACKEND, method="GET")
+        with urllib.request.urlopen(req, timeout=0.8):
+            return "ok"
+    except Exception:
+        return "down"
+
+
+@app.route('/vision', methods=['GET'])
+def vision_proxy():
+    """
+    Reenvia la peticion (con su query string, p.ej. ?min_z=0.25) al
+    vision_service. Si el backend no responde, devuelve 503 con
+    detections=[] — el cliente distingue asi 'sin markers' de 'sin vision'
+    y NO mueve el robot a ciegas.
+    """
+    url = VISION_BACKEND
+    if request.query_string:
+        url += "?" + request.query_string.decode("ascii", errors="ignore")
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as r:
+            return app.response_class(response=r.read(),
+                                      mimetype='application/json')
+    except Exception as e:
+        log.warning("Vision backend caido (%s): %s", VISION_BACKEND, e)
+        return jsonify({"detections": [], "error": "vision backend down"}), 503
 
 
 # ── /transcribe ───────────────────────────────────────────────────────────────
@@ -212,7 +256,8 @@ if __name__ == '__main__':
     print(f"  Modelo  : {LLM_MODEL}")
     print("  Puerto  : http://0.0.0.0:3000")
     print(f"  Contrato: {CONTRACT_VERSION}")
-    print("  Endpoints: /health  /query  /query_stream  /transcribe")
+    print(f"  Vision  : {VISION_BACKEND} [{_vision_status()}]")
+    print("  Endpoints: /health  /query  /query_stream  /transcribe  /vision")
     print("=" * 55)
     # threaded=True: SSE mantiene la conexión abierta; sin esto, /transcribe
     # u otra query concurrente bloquearía.
