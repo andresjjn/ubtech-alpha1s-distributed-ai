@@ -169,9 +169,13 @@ tapa/base sin marcador). Consecuencias:
   layout es controlado y frontal; la búsqueda por giro sigue siendo el
   último recurso.
 - **Blindaje obligatorio en el servicio de visión:** descartar detecciones
-  sin profundidad estéreo válida, y durante la carga ignorar z < 0.25 m —
+  sin profundidad estéreo válida, y durante la carga filtrar por `min_z` —
   así un marker residual del cubo abrazado jamás contamina la navegación.
-  Verificar en hardware (Fase 3) que el cubo cargado realmente desaparece.
+  INVARIANTE (bug cazado por test en la implementación): el filtro de carga
+  debe quedar SIEMPRE por debajo de la distancia de llegada, o la base se
+  vuelve invisible justo al llegar; `_run_leg` lo garantiza con
+  `min_z = min(CARRY_MIN_Z, z_arrive − 0.05)`. Verificar en hardware
+  (Fase 3) que el cubo cargado realmente desaparece de `/vision`.
 - **Aproximación ciega calibrada como fallback** (se implementa igual): si
   se pierde toda referencia en zona fina, tomar la última z conocida y
   avanzar `ceil((z_ult − Z_HUG)/STEP_M)` pasos sin visión, re-verificar y
@@ -307,9 +311,12 @@ servicio de percepción se REESCRIBE y esta vez queda versionado en el repo.
    hitos ("Lo tengo", "Voy a la caja", "Colocado") y cancelación segura
    (cancel sosteniendo → deposita en el piso, nunca init).
 4. Verificación post-place (tras retroceder 2 pasos): DOS detecciones de
-   id 7 apiladas — misma z (±5 cm), alturas separadas ~10 cm — y el id 8 de
-   la base ya NO visible (lo ocluye el cubo puesto encima) → "misión
-   cumplida"; si no, 1 reintento de colocación.
+   id 7 apiladas — misma z (±10 cm), alturas separadas ≥5 cm → "misión
+   cumplida"; si no, se REPORTA hablando que no se pudo confirmar.
+   (Desviación consciente respecto al plan original: el "reintento de
+   colocación" exigiría re-agarrar un cubo ya soltado en posición
+   desconocida — es otra misión completa y con riesgo; se degradó a
+   reporte honesto por voz.)
 5. **Criterio:** misión completa por voz ("recoge el cubo y ponlo sobre la
    caja") con éxito 4/5 desde posiciones iniciales distintas.
 

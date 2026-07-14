@@ -979,9 +979,13 @@ def _listen_for_cancel(cancel_event, stop_event):
 MISSION_LABELS = frozenset(("aruco_7", "aruco_8", "aruco_9", "aruco_10"))
 
 Z_HUG        = 0.18   # m: llegada de la ida (marker superior en pos. abrazo)
-Z_PLACE      = 0.24   # m: llegada de la entrega (cubo sobre la base) CALIBRAR
-CARRY_MIN_Z  = 0.25   # m: filtro /vision cargando (marker residual del cubo)
+Z_PLACE      = 0.28   # m: llegada de la entrega (cubo sobre la base) CALIBRAR
+CARRY_MIN_Z  = 0.20   # m: filtro /vision cargando (marker residual del cubo;
+                      #    abrazado queda ~0.10-0.15, bajo el rango estereo)
 GRAB_CHECK_Z = 0.35   # m: si un marker sigue a menos de esto, el agarre fallo
+# INVARIANTE: el filtro de carga debe quedar POR DEBAJO de la distancia de
+# llegada (si no, la base se volveria invisible justo al llegar). _run_leg
+# lo garantiza estructuralmente: min_z = min(CARRY_MIN_Z, z_arrive - 0.05).
 
 
 def _vision_ready():
@@ -1015,7 +1019,8 @@ def _run_leg(robot, cancel_event, carrying, z_arrive, say,
     estados. carrying=True: gaits con brazos fijos en la pose de agarre y
     percepcion filtrada por CARRY_MIN_Z."""
     from mission import FetchMission
-    min_z = CARRY_MIN_Z if carrying else None
+    # El filtro de carga JAMAS por encima de la distancia de llegada.
+    min_z = min(CARRY_MIN_Z, z_arrive - 0.05) if carrying else None
     arms  = HOLD_ARMS if carrying else None
     m = FetchMission(
         target,
