@@ -112,21 +112,20 @@ Alpha1s_modernization/
 │   ├── alpha1s_usb.py              # USB HID transport driver (con lock, v2)
 │   ├── stream_parser.py            # SSE streaming parser (arreglado para v3)
 │   ├── alpha1s_prompt.py           # Copia sincronizada del prompt (import CONTRACT_VERSION)
-│   ├── mission.py                  # V3: misión de servovisión (fetch_object)
+│   ├── mission.py                  # V4: máquina de misión (pick & place, lazo cerrado)
+│   ├── calibrate_steps.py          # V4: calibración guiada de STEP_M / SIDE_M
 │   ├── es_MX-claude-high.onnx      # Piper TTS voice model (Spanish)
-│   ├── sequences/                  # Full-body movement files (12 files)
-│   │   ├── mover_adelante.txt
-│   │   ├── mover_atras.txt
-│   │   ├── mover_a_la_derecha.txt
-│   │   ├── mover_a_la_izquierda.txt
-│   │   ├── girar_a_la_derecha.txt
-│   │   ├── girar_a_la_izquierda.txt
-│   │   ├── punetazo_derecho.txt
-│   │   ├── punetazo_izquierdo.txt
-│   │   ├── flexiones_de_pecho.txt
-│   │   ├── posicion_inicial.txt
-│   │   ├── levantarse_desde_el_frente.txt
-│   │   └── levantarse_desde_la_espalda.txt
+│   ├── sequences/                  # Full-body movement files (19 files)
+│   │   ├── mover_adelante.txt · mover_atras.txt
+│   │   ├── mover_a_la_derecha.txt · mover_a_la_izquierda.txt
+│   │   ├── girar_a_la_derecha.txt · girar_a_la_izquierda.txt
+│   │   ├── punetazo_derecho.txt · punetazo_izquierdo.txt
+│   │   ├── flexiones_de_pecho.txt · posicion_inicial.txt
+│   │   ├── levantarse_desde_el_frente.txt · levantarse_desde_la_espalda.txt
+│   │   ├── paso_adelante.txt · paso_atras.txt          # V4: primitivas de misión (1 ciclo)
+│   │   ├── paso_derecha.txt · paso_izquierda.txt       # V4: 1 paso lateral
+│   │   ├── abrazar_objeto.txt · soltar_objeto.txt      # V4: agarre / salida segura
+│   │   └── colocar_objeto.txt                          # V4: suelta de pie (EXPERIMENTAL)
 │   └── gestures/                   # Arm-only gesture files (run parallel to TTS)
 │       ├── saludar.txt  · despedirse.txt · presentarse.txt · reverencia.txt
 │       ├── brazos_abiertos_bienvenida.txt · pensar.txt · afirmar.txt
@@ -134,13 +133,18 @@ Alpha1s_modernization/
 │       └── explicar_derecha.txt · explicar_izquierda.txt · explicar_ambos.txt · hablar_relajado.txt
 │
 ├── server/                         # ROG Ally X — LLM + STT + TTS + Flask
-│   ├── server.py                   # Flask :3000 — /health + /query + /query_stream + /transcribe
-│   ├── alpha1s_prompt.py           # System prompt + JSON schema v3 (single source of truth)
+│   ├── server.py                   # Flask :3000 — /health /query /query_stream /transcribe /vision
+│   ├── alpha1s_prompt.py           # System prompt + JSON schema v3.1 (single source of truth)
+│   ├── validate_prompt.py          # V4: validación live del contrato contra LM Studio
+│   ├── vision/
+│   │   ├── vision_service.py       # V4: OAK-D + ArUco + profundidad → GET /vision (:3001)
+│   │   └── escena_ejemplo.json     # V4: escena para el modo --fake (sin cámara)
 │   └── benchmark.py                # Phase 6: TTFT / tok/s / valid JSON / gestures per model
 │
-├── tests/                          # v2: 29 tests sin hardware (choreographer, behaviors, …)
+├── tests/                          # 51 tests sin hardware (misión, carga, visión, gestos, …)
 ├── deploy_pi.sh                    # v2: rsync del cliente a la Pi (dry-run por defecto)
 ├── PLAN_GESTOS_CONTINUOS.md        # v2: plan de ejecución (3 fases)
+├── PLAN_RECOGER_Y_ENTREGAR.md      # V4: plan pick & place (errores + diseño + fases)
 │
 ├── simulation/                     # ROS2 + Gazebo work (ABANDONED — kept as reference)
 │   └── alpha1s_bringup/
@@ -245,6 +249,45 @@ python client.py
 
 5. Say **"alfa"** to trigger the wake word, then speak your command.
 
+### Servicio de visión (V4 — máquina con la OAK-D)
+
+```bash
+cd server/vision/
+pip install depthai opencv-contrib-python flask numpy
+python vision_service.py --debug     # 1a vez: valida ejes/escala/diccionario en la ventana
+python vision_service.py             # operación normal en :3001
+python vision_service.py --fake escena_ejemplo.json   # sin cámara (pruebas)
+```
+
+Si la OAK-D va en **otra** máquina que el ROG, apunta el proxy: `set VISION_BACKEND=http://IP_DE_LA_MAC:3001/vision` antes de arrancar `server.py`. Con `--debug`, verifica: (1) que detecta los markers del cubo (si no, prueba `--dict 5X5_50`…), (2) que `z` coincide con la cinta métrica ±3 cm, (3) que `x` es positivo cuando el cubo está a la DERECHA de la cámara (si sale invertido, pon `SWAP_SIDES=True` en `mission.py`). Sin pantalla, usa **`GET /snapshot`** (JPEG anotado) para ver lo que ve la cámara en remoto.
+
+### Contenedores ROS 2 (V4)
+
+Los servicios del host corren en contenedores basados en `ros:humble` — el **mismo stack en la MacBook y en el ROG** (`docker/`):
+
+| Servicio | Imagen | Mac | ROG / Linux |
+|---|---|---|---|
+| `server` (:3000, LLM gateway + STT) | `alpha1s/server` | ✅ contenedor | ✅ contenedor |
+| `vision` (:3001, OAK-D + ArUco) | `alpha1s/vision` | ⚠️ **nativo** (`run_native.sh`) | ✅ contenedor (perfil `linux-usb`) |
+| LM Studio (GPU) | — | nativo | nativo (el contenedor lo alcanza vía `host.docker.internal:1234`) |
+
+```bash
+# MacBook (OAK-D en la Mac): visión nativa + server en contenedor
+server/vision/run_native.sh &
+docker compose -f docker/docker-compose.yml up -d server
+
+# ROG / Linux con la OAK-D (WSL2: attach previo con usbipd)
+VISION_BACKEND=http://vision:3001/vision \
+  docker compose -f docker/docker-compose.yml --profile linux-usb up -d
+
+# Smoke test sin cámara ni LM Studio (STT pequeño)
+STT_MODEL=tiny docker compose -f docker/docker-compose.yml up -d server
+```
+
+> ⚠️ **Limitación dura de macOS:** Docker Desktop no pasa dispositivos USB al contenedor, así que el servicio de visión corre **nativo** en la Mac (misma API HTTP → transparente para el resto del stack). En Linux/WSL2 sí va contenedorizado (`privileged` + `/dev/bus/usb`). Dentro del contenedor ROS, el servicio además **publica las detecciones en el topic `/alpha1s/detections`** (rclpy, `std_msgs/String` con el JSON).
+
+El modelo STT se descarga una sola vez al volumen `whisper-cache`. Config por entorno: `LLM_API_BASE_URL`, `VISION_BACKEND`, `STT_MODEL`.
+
 #### Deploy desde el repo (v2)
 
 Desde una máquina de desarrollo, sincroniza el cliente a la Pi con el script incluido (rsync con dry-run por defecto):
@@ -264,9 +307,13 @@ All endpoints are served by `rog_server_fase4.py` on port `3000`.
 
 | Method | Path | Input | Output |
 |---|---|---|---|
-| `POST` | `/query` | `{"text": "..."}` | `{"response": "<JSON string>"}` |
+| `GET` | `/health` | — | `{"status","contract","model","stt","vision"}` |
+| `POST` | `/query` | `{"text": "..."}` | JSON del contrato (directo) |
 | `POST` | `/query_stream` | `{"text": "..."}` | Server-Sent Events (JSON chunks) |
 | `POST` | `/transcribe` | WAV file (multipart) | `{"text": "..."}` |
+| `GET` | `/vision` | `?min_z=0.25` opcional | proxy → `{"detections":[{label, xyz_m, confidence}]}` (503 si el backend está caído) |
+
+El servicio de visión (`server/vision/vision_service.py`, puerto **3001**) corre en la máquina donde esté enchufada la OAK-D (ROG **o** MacBook); `server.py` le hace proxy vía `VISION_BACKEND` para que el cliente Pi apunte siempre a `ROG:3000/vision`.
 
 **LLM parameters (active):**
 
@@ -281,9 +328,9 @@ All endpoints are served by `rog_server_fase4.py` on port `3000`.
 
 ---
 
-## JSON Contract (v3)
+## JSON Contract (v3.1)
 
-> **Contrato v3 (v2, julio 2026).** El JSON tiene **siempre las 5 claves**, todas `required` en el schema, en este orden: `gesture_sequence`, `action`, `target`, `targets`, `response`. Los valores `"none"` y `[]` son los sentinelas de *sin acción* / *sin encadenar*.
+> **Contrato v3.1 (V4, julio 2026).** El JSON tiene **siempre las 5 claves**, todas `required` en el schema, en este orden: `gesture_sequence`, `action`, `target`, `targets`, `response`. Los valores `"none"` y `[]` son los sentinelas de *sin acción* / *sin encadenar*. v3.1 reintegra la acción `fetch_object` (misión de visión) con los targets `recoger_cubo` / `entregar_cubo` / `mision_completa`.
 >
 > **Por qué todas requeridas:** LM Studio (gramática de llama.cpp) **omite las propiedades opcionales** del schema con mucha frecuencia — el modelo dejaba de emitir `action` en comandos físicos. Con toda clave en `required`, la gramática escribe la clave y el modelo solo elige el valor del enum. Esto reemplazó al contrato v1 (objeto anidado `parameters`, que sufría el mismo problema).
 
@@ -320,6 +367,22 @@ El cliente ejecuta la cadena en orden, verifica la postura entre pasos, y admite
 ```json
 {"gesture_sequence": [], "action": "control_led", "target": "led_on", "targets": [], "response": "Encendiendo luces."}
 ```
+
+### Type 5 — Misión pick & place (V4, `action: fetch_object`)
+
+```json
+{"gesture_sequence": [], "action": "fetch_object", "target": "mision_completa", "targets": [], "response": "Voy por el cubo y lo pondré sobre la caja."}
+```
+
+El LLM solo elige el **rol** de la misión; los IDs ArUco y los tramos los resuelve el cliente:
+
+| `target` | Qué hace el robot |
+|---|---|
+| `recoger_cubo` | Camina hasta el cubo (lazo cerrado con `/vision`), lo abraza, verifica el agarre (1 reintento) y activa el estado `HOLDING` |
+| `entregar_cubo` | Ya sosteniéndolo: camina hasta la caja base **con los brazos fijos en la pose de agarre** (`arm_override`), lo coloca encima, retrocede 2 pasos y verifica (dos `id 7` apilados) |
+| `mision_completa` | Ambos tramos seguidos, con narración por hitos |
+
+**Convención de markers:** ambas cajas usan el mismo juego impreso (`cubo_armable_10cm_A4.pdf`, ids 7-10) orientado con **id 7 al frente e id 8 arriba**. El rol se desambigua por estado: en la ida el `{7,8}` más cercano es el cubo; cargando, el cubo abrazado desaparece de `/vision` (ocluido + bajo el rango del estéreo + filtro `min_z`) y el único visible es la base. Cancelación por voz en todo el trayecto; cancelar sosteniendo **deposita** el cubo (jamás abre brazos a init). Sin `/vision` (503), el robot lo dice y **no se mueve**.
 
 ### Gestos continuos (client-side, v2)
 

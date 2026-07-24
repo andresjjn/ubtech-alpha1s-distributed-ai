@@ -24,10 +24,16 @@ v2 -> v3: se añadió "targets" (lista) para encadenar varias secuencias.
 # Version del contrato JSON. El cliente la compara contra /health para
 # detectar despliegues asimetricos Pi/ROG (ver server.py y client.py).
 # v3 (Fase 3): anade "targets" opcional para encadenar secuencias.
-CONTRACT_VERSION = "v3"
+# v3.1 (V4): reintegra la accion "fetch_object" (mision de vision) con los
+# targets de mision recoger_cubo / entregar_cubo / mision_completa.
+CONTRACT_VERSION = "v3.1"
 
 # ── Configuración LLM ─────────────────────────────────────────────────────────
-LLM_API_BASE_URL = "http://localhost:1234/v1"
+# V4: sobreescribible por entorno — dentro del contenedor Docker, LM Studio
+# vive en el HOST (GPU): LLM_API_BASE_URL=http://host.docker.internal:1234/v1
+import os
+LLM_API_BASE_URL = os.environ.get("LLM_API_BASE_URL",
+                                  "http://localhost:1234/v1")
 # ⚠️  Verificar string exacto en LM Studio → Models. Distingue mayúsculas.
 # OJO: "qwen2.5-7b-instruct" (sin -vl) NO existe en este LM Studio; las
 # peticiones con nombre desconocido caían en el modelo que estuviera cargado.
@@ -64,7 +70,12 @@ SEQUENCE_NAMES = [
 POSE_NAMES  = ["init", "hands_up"]
 LED_TARGETS = ["led_on", "led_off"]
 
-TARGET_NAMES = ["none"] + SEQUENCE_NAMES + POSE_NAMES + LED_TARGETS
+# V4: misiones de vision (accion fetch_object). El LLM elige el ROL de la
+# mision; los IDs ArUco y los tramos los resuelve el cliente (mission.py).
+MISSION_TARGETS = ["recoger_cubo", "entregar_cubo", "mision_completa"]
+
+TARGET_NAMES = (["none"] + SEQUENCE_NAMES + POSE_NAMES + LED_TARGETS
+                + MISSION_TARGETS)
 
 # ── JSON Schema (contrato v3) ─────────────────────────────────────────────────
 # TODAS las propiedades en required: la gramática de LM Studio escribe cada
@@ -83,7 +94,8 @@ ALPHA1S_SCHEMA = {
             },
             "action": {
                 "type": "string",
-                "enum": ["none", "execute_sequence", "execute_pose", "control_led"]
+                "enum": ["none", "execute_sequence", "execute_pose",
+                         "control_led", "fetch_object"]
             },
             "target": {
                 "type": "string",
@@ -118,7 +130,7 @@ Tu única salida es UN ÚNICO objeto JSON válido. Sin texto antes ni después. 
 
 El JSON contiene SIEMPRE exactamente estas cinco claves, en este orden:
   1. "gesture_sequence": lista de gestos del catálogo, o [] si no aplica
-  2. "action": "none", "execute_sequence", "execute_pose" o "control_led"
+  2. "action": "none", "execute_sequence", "execute_pose", "control_led" o "fetch_object"
   3. "target": el objetivo de la acción, o "none" si action es "none"
   4. "targets": lista de secuencias a encadenar EN ORDEN, o [] si no encadenas
   5. "response": el texto que dirás en voz alta
@@ -171,6 +183,21 @@ Targets de pose: "init", "hands_up" ("levanta los brazos" → hands_up)
 4. CONTROL DE LEDS
 {"gesture_sequence": [], "action": "control_led", "target": "led_on", "targets": [], "response": "<texto corto>"}
 "enciende las luces/ojos" → led_on   |   "apaga las luces/ojos" → led_off
+
+5. MISIÓN DE OBJETO — el usuario ordena buscar, traer o llevar el cubo FÍSICAMENTE
+{"gesture_sequence": [], "action": "fetch_object", "target": "<misión>", "targets": [], "response": "<texto corto>"}
+
+Uso mi cámara para localizar el cubo por sus marcadores, camino hasta él,
+lo abrazo y puedo llevarlo hasta la caja base. Mapeo de frases → target:
+  busca/ve por/trae/recoge/agarra el cubo (o la caja)      → recoger_cubo
+  lleva/pon/coloca/deja el cubo sobre/encima de la caja    → entregar_cubo
+  recoge el cubo Y ponlo sobre la caja (ambas cosas)       → mision_completa
+
+REGLA: estas son misiones físicas con visión; siempre action="fetch_object"
+con su target de misión. "entregar_cubo" solo tiene sentido si ya lo estoy
+sosteniendo. Si el usuario pide recogerlo y entregarlo en la misma frase,
+usa "mision_completa". Preguntas SOBRE el cubo o sobre mis capacidades
+("¿puedes cargar cosas?", "¿ves el cubo?") son tipo 1 conversacional.
 
 ════════════════════════════════════════
 CATÁLOGO DE GESTOS
@@ -329,5 +356,23 @@ Usuario: "Enciende tus luces"
 
 Usuario: "Apaga tus luces"
 {"gesture_sequence": [], "action": "control_led", "target": "led_off", "targets": [], "response": "Apagando las luces."}
+
+Usuario: "Busca el cubo y tráelo"
+{"gesture_sequence": [], "action": "fetch_object", "target": "recoger_cubo", "targets": [], "response": "Voy por el cubo."}
+
+Usuario: "Recoge el cubo"
+{"gesture_sequence": [], "action": "fetch_object", "target": "recoger_cubo", "targets": [], "response": "Enseguida, voy a recoger el cubo."}
+
+Usuario: "Lleva el cubo a la caja"
+{"gesture_sequence": [], "action": "fetch_object", "target": "entregar_cubo", "targets": [], "response": "Llevando el cubo a la caja."}
+
+Usuario: "Pon el cubo encima de la caja"
+{"gesture_sequence": [], "action": "fetch_object", "target": "entregar_cubo", "targets": [], "response": "Voy a poner el cubo sobre la caja."}
+
+Usuario: "Recoge el cubo y ponlo sobre la caja"
+{"gesture_sequence": [], "action": "fetch_object", "target": "mision_completa", "targets": [], "response": "Voy por el cubo y lo pondré sobre la caja."}
+
+Usuario: "¿Puedes cargar objetos?"
+{"gesture_sequence": ["afirmar", "explicar_derecha"], "action": "none", "target": "none", "targets": [], "response": "Sí. Con mi cámara localizo el cubo por sus marcadores, lo recojo y puedo ponerlo sobre la caja. Pídemelo cuando quieras."}
 
 Responde siempre en español. Tu única salida válida es el objeto JSON con las cinco claves."""

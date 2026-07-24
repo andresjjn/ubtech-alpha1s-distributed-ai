@@ -1,0 +1,56 @@
+# Alpha 1S — stack de servicios en contenedores ROS 2 (humble).
+#
+# El MISMO compose corre en la MacBook y en el ROG; solo cambia donde vive
+# el servicio de vision (limitacion dura: Docker Desktop en macOS no pasa
+# USB a los contenedores).
+#
+# ── MacBook (OAK-D enchufada a la Mac) ────────────────────────────────────
+#   1. Vision NATIVA:   server/vision/run_native.sh
+#   2. Server en ROS:   docker compose -f docker/docker-compose.yml up -d server
+#      (VISION_BACKEND ya apunta al host por defecto)
+#
+# ── ROG / cualquier Linux con la OAK-D (WSL2: attach con usbipd) ──────────
+#   VISION_BACKEND=http://vision:3001/vision \
+#   docker compose -f docker/docker-compose.yml --profile linux-usb up -d
+#
+# ── Pruebas sin nada (ni camara ni LM Studio) ─────────────────────────────
+#   STT_MODEL=tiny docker compose -f docker/docker-compose.yml up -d server
+#
+# LM Studio SIEMPRE queda nativo en el host (GPU): el contenedor lo alcanza
+# via host.docker.internal:1234.
+
+name: alpha1s
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    image: alpha1s/server
+    ports:
+      - "3000:3000"
+    environment:
+      LLM_API_BASE_URL: ${LLM_API_BASE_URL:-http://host.docker.internal:1234/v1}
+      VISION_BACKEND:   ${VISION_BACKEND:-http://host.docker.internal:3001/vision}
+      STT_MODEL:        ${STT_MODEL:-large-v3-turbo}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # motores Linux (en Desktop ya existe)
+    volumes:
+      - whisper-cache:/root/.cache/huggingface   # el modelo STT se baja 1 sola vez
+    restart: unless-stopped
+
+  vision:
+    build:
+      context: ..
+      dockerfile: docker/vision.Dockerfile
+    image: alpha1s/vision
+    profiles: ["linux-usb"]     # solo donde el contenedor puede ver el USB
+    privileged: true            # acceso al bus USB (OAK-D re-enumera al bootear)
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
+volumes:
+  whisper-cache:
