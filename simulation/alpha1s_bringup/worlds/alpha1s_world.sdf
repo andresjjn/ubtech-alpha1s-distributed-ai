@@ -1,0 +1,698 @@
+<?xml version="1.0" ?>
+<!--
+  Alpha 1S — World SDF para Gazebo Ignition Fortress
+  Cambios respecto a versión anterior:
+    1. Renames: l/r_ankle_pitch_joint (link) → l/r_lower_leg_link
+                l/r_ankle_pitch_joint_joint (joint) → l/r_ankle_pitch_joint
+    2. Plugin IMU duplicado eliminado
+    3. JointPositionControllers para los 17 joints (antes solo 11)
+    4. Contact sensors en l/r_foot_link
+  Topics ROS2 esperados después del bridge:
+    /joint_states              (sensor_msgs/JointState, 17 joints)
+    /imu/data                  (sensor_msgs/Imu)
+    /model/alpha1s/pose        (tf2_msgs/TFMessage)
+    /alpha1s/cmd/<joint_name>  (std_msgs/Float64) × 17
+    /foot_contact/left         (ros_gz_interfaces/Contacts)
+    /foot_contact/right        (ros_gz_interfaces/Contacts)
+  Servicio del world:
+    /world/alpha1s_world/control  (ros_gz_interfaces/srv/ControlWorld)
+-->
+<sdf version="1.8">
+  <world name="alpha1s_world">
+
+    <!-- ── Plugins del mundo ── -->
+    <plugin filename="ignition-gazebo-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="ignition-gazebo-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="ignition-gazebo-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="ignition-gazebo-imu-system"
+            name="gz::sim::systems::Imu"/>
+    <plugin filename="ignition-gazebo-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre</render_engine>
+    </plugin>
+    <plugin filename="ignition-gazebo-contact-system"
+            name="gz::sim::systems::Contact"/>
+
+    <!-- ── Luz ── -->
+    <light type="directional" name="sun">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range><constant>1.0</constant>
+        <linear>0.0</linear><quadratic>0.0</quadratic>
+      </attenuation>
+      <direction>0 0 -1</direction>
+    </light>
+    <light type="directional" name="fill">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 5 0 0 0</pose>
+      <diffuse>0.6 0.6 0.6 1</diffuse>
+      <specular>0.0 0.0 0.0 1</specular>
+      <attenuation>
+        <range>1000</range><constant>1.0</constant>
+        <linear>0.0</linear><quadratic>0.0</quadratic>
+      </attenuation>
+      <direction>0 0.5 -0.5</direction>
+    </light>
+
+    <!-- ── Suelo ── -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <surface><friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material>
+            <ambient>0.4 0.6 0.4 1</ambient>
+            <diffuse>0.4 0.6 0.4 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         ALPHA 1S ROBOT
+         ================================================================ -->
+    <model name="alpha1s">
+      <pose>0 0 0.30 0 0 0</pose>
+      <self_collide>false</self_collide>
+
+      <!-- ── BASE LINK (torso) ── -->
+      <link name="base_link">
+        <pose>0 0 0 0 0 0</pose>
+        <inertial>
+          <mass>0.5923</mass>
+          <inertia><ixx>0.003120</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.001890</iyy><iyz>0</iyz><izz>0.002410</izz></inertia>
+        </inertial>
+        <visual name="visual">
+          <geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/base_link.stl</uri></mesh></geometry>
+          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <pose>0 -0.005 0 0 0 0</pose>
+          <geometry>
+            <sphere>
+              <radius>0.08</radius>
+            </sphere>
+          </geometry>
+        </collision>
+
+        <!-- IMU sensor -->
+        <sensor name="imu_sensor" type="imu">
+          <always_on>1</always_on>
+          <update_rate>200</update_rate>
+          <topic>/alpha1s/imu</topic>
+          <imu>
+            <angular_velocity>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.002</stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.002</stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.002</stddev></noise></z>
+            </angular_velocity>
+            <linear_acceleration>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.017</stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.017</stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.017</stddev></noise></z>
+            </linear_acceleration>
+          </imu>
+        </sensor>
+      </link>
+
+      <!-- ── CABEZA ── -->
+      <link name="Head_link">
+        <pose relative_to="neck_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.2257</mass>
+          <inertia><ixx>0.000520</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000480</iyy><iyz>0</iyz><izz>0.000310</izz></inertia>
+        </inertial>
+        <visual name="visual">
+          <geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/Head_link.stl</uri></mesh></geometry>
+          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/Head_link.stl</uri></mesh></geometry>
+        </collision>
+      </link>
+      <joint name="neck_joint" type="revolute">
+        <pose relative_to="base_link">-0.000228 -0.009340 0.057200 0 0 0</pose>
+        <parent>base_link</parent><child>Head_link</child>
+        <axis><xyz>0 0 1</xyz>
+          <limit><lower>-1.047</lower><upper>1.047</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- ── BRAZO IZQUIERDO ── -->
+      <link name="l_shoulder_link">
+        <pose relative_to="l_shoulder_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0613</mass>
+          <inertia><ixx>0.000048</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000052</iyy><iyz>0</iyz><izz>0.000031</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_shoulder_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_shoulder_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="l_shoulder_joint" type="revolute">
+        <pose relative_to="base_link">0.055000 -0.011620 0.029880 0 0 0</pose>
+        <parent>base_link</parent><child>l_shoulder_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.745</lower><upper>1.745</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="l_arm_link">
+        <pose relative_to="l_arm_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0787</mass>
+          <inertia><ixx>0.000180</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000120</iyy><iyz>0</iyz><izz>0.000095</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_arm_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_arm_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="l_arm_joint" type="revolute">
+        <pose relative_to="l_shoulder_link">0.021170 0.018730 -0.000040 0 0 0</pose>
+        <parent>l_shoulder_link</parent><child>l_arm_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-1.571</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="l_forearm_link">
+        <pose relative_to="l_elbow_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.1040</mass>
+          <inertia><ixx>0.000210</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000310</iyy><iyz>0</iyz><izz>0.000140</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_forearm_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_forearm_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="l_elbow_joint" type="revolute">
+        <pose relative_to="l_arm_link">0.059180 -0.003730 -0.000390 0 0 0</pose>
+        <parent>l_arm_link</parent><child>l_forearm_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-1.571</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- ── BRAZO DERECHO ── -->
+      <link name="r_shoulder_link">
+        <pose relative_to="r_shoulder_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0613</mass>
+          <inertia><ixx>0.000048</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000052</iyy><iyz>0</iyz><izz>0.000031</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_shoulder_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_shoulder_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="r_shoulder_joint" type="revolute">
+        <pose relative_to="base_link">-0.055000 -0.011620 0.029880 0 0 0</pose>
+        <parent>base_link</parent><child>r_shoulder_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.745</lower><upper>1.745</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="r_arm_link">
+        <pose relative_to="r_arm_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0787</mass>
+          <inertia><ixx>0.000180</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000120</iyy><iyz>0</iyz><izz>0.000095</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_arm_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_arm_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="r_arm_joint" type="revolute">
+        <pose relative_to="r_shoulder_link">-0.021170 0.018730 -0.000040 0 0 0</pose>
+        <parent>r_shoulder_link</parent><child>r_arm_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-1.571</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="r_forearm_link">
+        <pose relative_to="r_elbow_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.1040</mass>
+          <inertia><ixx>0.000210</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000310</iyy><iyz>0</iyz><izz>0.000140</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_forearm_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_forearm_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="r_elbow_joint" type="revolute">
+        <pose relative_to="r_arm_link">-0.059180 -0.003730 -0.000390 0 0 0</pose>
+        <parent>r_arm_link</parent><child>r_forearm_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-1.571</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- ── PIERNA IZQUIERDA ── -->
+      <link name="l_hip_roll_link">
+        <pose relative_to="l_hip_roll_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0618</mass>
+          <inertia><ixx>0.000052</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000048</iyy><iyz>0</iyz><izz>0.000038</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_hip_roll_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_hip_roll_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="l_hip_roll_joint" type="revolute">
+        <pose relative_to="base_link">0.026530 -0.018220 -0.045170 0 0 0</pose>
+        <parent>base_link</parent><child>l_hip_roll_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-1.571</lower><upper>0.524</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="l_knee_link">
+        <pose relative_to="l_hip_pitch_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.1035</mass>
+          <inertia><ixx>0.000310</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000850</iyy><iyz>0</iyz><izz>0.000620</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_knee_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_knee_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="l_hip_pitch_joint" type="revolute">
+        <pose relative_to="l_hip_roll_link">-0.013140 0.014840 -0.044380 0 0 0</pose>
+        <parent>l_hip_roll_link</parent><child>l_knee_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.571</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- RENAMED: l_ankle_pitch_joint (link) → l_lower_leg_link -->
+      <link name="l_lower_leg_link">
+        <pose relative_to="l_knee_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0493</mass>
+          <inertia><ixx>0.000065</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000082</iyy><iyz>0</iyz><izz>0.000058</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_lower_leg_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_lower_leg_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="l_knee_joint" type="revolute">
+        <pose relative_to="l_knee_link">-0.005660 -0.014250 -0.044230 0 0 0</pose>
+        <parent>l_knee_link</parent><child>l_lower_leg_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.325</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="l_ankle_link">
+        <pose relative_to="l_ankle_pitch_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0529</mass>
+          <inertia><ixx>0.000048</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000062</iyy><iyz>0</iyz><izz>0.000041</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_ankle_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_ankle_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <!-- RENAMED: l_ankle_pitch_joint_joint → l_ankle_pitch_joint -->
+      <joint name="l_ankle_pitch_joint" type="revolute">
+        <pose relative_to="l_lower_leg_link">0.001250 0.002250 -0.058450 0 0 0</pose>
+        <parent>l_lower_leg_link</parent><child>l_ankle_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.047</lower><upper>1.047</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="l_foot_link">
+        <pose relative_to="l_ankle_roll_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.1211</mass>
+          <inertia><ixx>0.000240</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000380</iyy><iyz>0</iyz><izz>0.000190</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/l_foot_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision">
+          <geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/l_foot_link.stl</uri></mesh></geometry>
+          <surface><friction><ode><mu>0.9</mu><mu2>0.8</mu2></ode></friction></surface>
+        </collision>
+        <!-- Sensor de contacto pie izquierdo -->
+        <sensor name="l_foot_contact_sensor" type="contact">
+          <always_on>true</always_on>
+          <update_rate>100</update_rate>
+          <topic>foot_contact/left</topic>
+          <contact>
+            <collision>collision</collision>
+          </contact>
+        </sensor>
+      </link>
+      <joint name="l_ankle_roll_joint" type="revolute">
+        <pose relative_to="l_ankle_link">0.012350 -0.012880 -0.037490 0 0 0</pose>
+        <parent>l_ankle_link</parent><child>l_foot_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-0.349</lower><upper>1.396</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- ── PIERNA DERECHA ── -->
+      <link name="r_hip_roll_link">
+        <pose relative_to="r_hip_roll_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0618</mass>
+          <inertia><ixx>0.000052</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000048</iyy><iyz>0</iyz><izz>0.000038</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_hip_roll_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_hip_roll_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="r_hip_roll_joint" type="revolute">
+        <pose relative_to="base_link">-0.026530 -0.018220 -0.045170 0 0 0</pose>
+        <parent>base_link</parent><child>r_hip_roll_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-0.524</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="r_knee_link">
+        <pose relative_to="r_hip_pitch_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.1035</mass>
+          <inertia><ixx>0.000310</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000850</iyy><iyz>0</iyz><izz>0.000620</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_knee_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_knee_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="r_hip_pitch_joint" type="revolute">
+        <pose relative_to="r_hip_roll_link">0.013140 0.014840 -0.044380 0 0 0</pose>
+        <parent>r_hip_roll_link</parent><child>r_knee_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.571</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- RENAMED: r_ankle_pitch_joint (link) → r_lower_leg_link -->
+      <link name="r_lower_leg_link">
+        <pose relative_to="r_knee_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0493</mass>
+          <inertia><ixx>0.000065</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000082</iyy><iyz>0</iyz><izz>0.000058</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_lower_leg_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_lower_leg_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <joint name="r_knee_joint" type="revolute">
+        <pose relative_to="r_knee_link">0.005660 -0.014250 -0.044230 0 0 0</pose>
+        <parent>r_knee_link</parent><child>r_lower_leg_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.325</lower><upper>1.571</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="r_ankle_link">
+        <pose relative_to="r_ankle_pitch_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.0529</mass>
+          <inertia><ixx>0.000048</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000062</iyy><iyz>0</iyz><izz>0.000041</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_ankle_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision"><geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_ankle_link.stl</uri></mesh></geometry></collision>
+      </link>
+      <!-- RENAMED: r_ankle_pitch_joint_joint → r_ankle_pitch_joint -->
+      <joint name="r_ankle_pitch_joint" type="revolute">
+        <pose relative_to="r_lower_leg_link">-0.001250 0.002250 -0.058450 0 0 0</pose>
+        <parent>r_lower_leg_link</parent><child>r_ankle_link</child>
+        <axis><xyz>1 0 0</xyz>
+          <limit><lower>-1.047</lower><upper>1.047</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <link name="r_foot_link">
+        <pose relative_to="r_ankle_roll_joint">0 0 0 0 0 0</pose>
+        <inertial><mass>0.1211</mass>
+          <inertia><ixx>0.000240</ixx><ixy>0</ixy><ixz>0</ixz>
+                   <iyy>0.000380</iyy><iyz>0</iyz><izz>0.000190</izz></inertia>
+        </inertial>
+        <visual name="visual"><geometry><mesh><uri>model://alpha1s_bringup/meshes/visual/r_foot_link.stl</uri></mesh></geometry>          <material>
+            <ambient>0.7 0.75 0.85 1</ambient>
+            <diffuse>0.7 0.75 0.85 1</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material></visual>
+        <collision name="collision">
+          <geometry><mesh><uri>model://alpha1s_bringup/meshes/collision/r_foot_link.stl</uri></mesh></geometry>
+          <surface><friction><ode><mu>0.9</mu><mu2>0.8</mu2></ode></friction></surface>
+        </collision>
+        <!-- Sensor de contacto pie derecho -->
+        <sensor name="r_foot_contact_sensor" type="contact">
+          <always_on>true</always_on>
+          <update_rate>100</update_rate>
+          <topic>foot_contact/right</topic>
+          <contact>
+            <collision>collision</collision>
+          </contact>
+        </sensor>
+      </link>
+      <joint name="r_ankle_roll_joint" type="revolute">
+        <pose relative_to="r_ankle_link">-0.012350 -0.012880 -0.037490 0 0 0</pose>
+        <parent>r_ankle_link</parent><child>r_foot_link</child>
+        <axis><xyz>0 1 0</xyz>
+          <limit><lower>-1.396</lower><upper>0.349</upper><effort>2.5</effort><velocity>6.28</velocity></limit>
+          <dynamics><damping>0.05</damping><friction>0.01</friction></dynamics>
+        </axis>
+      </joint>
+
+      <!-- ================================================================
+           PLUGINS DEL MODELO
+           ================================================================ -->
+
+      <!-- Joint State Publisher -->
+      <plugin filename="ignition-gazebo-joint-state-publisher-system"
+              name="gz::sim::systems::JointStatePublisher"/>
+
+      <!-- Pose Publisher -->
+      <plugin filename="ignition-gazebo-pose-publisher-system"
+              name="gz::sim::systems::PosePublisher">
+        <publish_link_pose>true</publish_link_pose>
+        <publish_nested_model_pose>false</publish_nested_model_pose>
+        <update_frequency>50</update_frequency>
+      </plugin>
+
+      <!-- ───── JointPositionControllers ───── -->
+      <!-- Cuello (1) -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>neck_joint</joint_name>
+        <topic>/alpha1s/cmd/neck_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+      <!-- Brazos (6): shoulders, arms, elbows -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_shoulder_joint</joint_name>
+        <topic>/alpha1s/cmd/l_shoulder_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_shoulder_joint</joint_name>
+        <topic>/alpha1s/cmd/r_shoulder_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_arm_joint</joint_name>
+        <topic>/alpha1s/cmd/l_arm_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_arm_joint</joint_name>
+        <topic>/alpha1s/cmd/r_arm_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_elbow_joint</joint_name>
+        <topic>/alpha1s/cmd/l_elbow_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_elbow_joint</joint_name>
+        <topic>/alpha1s/cmd/r_elbow_joint</topic>
+        <p_gain>10.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+      <!-- Caderas roll (2) -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_hip_roll_joint</joint_name>
+        <topic>/alpha1s/cmd/l_hip_roll_joint</topic>
+        <p_gain>15.0</p_gain><i_gain>0.1</i_gain><d_gain>0.8</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_hip_roll_joint</joint_name>
+        <topic>/alpha1s/cmd/r_hip_roll_joint</topic>
+        <p_gain>15.0</p_gain><i_gain>0.1</i_gain><d_gain>0.8</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+      <!-- Caderas pitch (2) -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_hip_pitch_joint</joint_name>
+        <topic>/alpha1s/cmd/l_hip_pitch_joint</topic>
+        <p_gain>15.0</p_gain><i_gain>0.1</i_gain><d_gain>0.8</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_hip_pitch_joint</joint_name>
+        <topic>/alpha1s/cmd/r_hip_pitch_joint</topic>
+        <p_gain>15.0</p_gain><i_gain>0.1</i_gain><d_gain>0.8</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+      <!-- Rodillas (2) -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_knee_joint</joint_name>
+        <topic>/alpha1s/cmd/l_knee_joint</topic>
+        <p_gain>15.0</p_gain><i_gain>0.1</i_gain><d_gain>0.8</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_knee_joint</joint_name>
+        <topic>/alpha1s/cmd/r_knee_joint</topic>
+        <p_gain>15.0</p_gain><i_gain>0.1</i_gain><d_gain>0.8</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+      <!-- Tobillos pitch (2) -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_ankle_pitch_joint</joint_name>
+        <topic>/alpha1s/cmd/l_ankle_pitch_joint</topic>
+        <p_gain>12.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_ankle_pitch_joint</joint_name>
+        <topic>/alpha1s/cmd/r_ankle_pitch_joint</topic>
+        <p_gain>12.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+      <!-- Tobillos roll (2) -->
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>l_ankle_roll_joint</joint_name>
+        <topic>/alpha1s/cmd/l_ankle_roll_joint</topic>
+        <p_gain>12.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+      <plugin filename="ignition-gazebo-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>r_ankle_roll_joint</joint_name>
+        <topic>/alpha1s/cmd/r_ankle_roll_joint</topic>
+        <p_gain>12.0</p_gain><i_gain>0.1</i_gain><d_gain>0.5</d_gain>
+        <i_max>1.0</i_max><i_min>-1.0</i_min><cmd_max>2.5</cmd_max><cmd_min>-2.5</cmd_min>
+      </plugin>
+
+    </model>
+  </world>
+</sdf>

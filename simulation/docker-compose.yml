@@ -1,0 +1,18 @@
+# Demo de simulacion Alpha 1S — escritorio web en http://localhost:6080
+#   docker compose -f simulation/docker-compose.yml up -d --build
+name: alpha1s-sim
+
+services:
+  sim:
+    build:
+      context: ..
+      dockerfile: simulation/Dockerfile
+    image: alpha1s/sim
+    ports:
+      - "6080:80"        # noVNC (escritorio en el navegador)
+    security_opt:
+      - seccomp:unconfined   # requerido por la imagen base (Ubuntu Jammy)
+    shm_size: "1gb"      # gz + rviz comparten memoria de render
+    environment:
+      - RESOLUTION=1600x900
+    restart: unless-stopped

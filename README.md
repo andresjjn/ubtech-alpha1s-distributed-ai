@@ -406,16 +406,18 @@ Servo IDs `0–15` (robot firmware uses `1–16` — `alpha1s_usb.py` handles th
 | 3 | Left Shoulder fwd/back | **inverted** — 180 = forward, 0 = back |
 | 4 | Left Shoulder up/down | **inverted** — 180 = down, 0 = up |
 | 5 | Left Elbow | **inverted** — 180 = in, 0 = out |
-| 6 | Right Hip Pitch | — |
-| 7 | Left Hip Pitch | — |
-| 8 | Right Hip Roll | — |
-| 9 | Left Hip Roll | — |
-| 10 | Right Knee | — |
-| 11 | Left Knee | — |
-| 12 | Right Ankle Pitch | — |
-| 13 | Left Ankle Pitch | — |
-| 14 | Right Ankle Roll | — |
+| 6 | Right Hip Roll | bloque pierna derecha (6-10) |
+| 7 | Right Hip Pitch | — |
+| 8 | Right Knee | — |
+| 9 | Right Ankle Pitch | — |
+| 10 | Right Ankle Roll | — |
+| 11 | Left Hip Roll | bloque pierna izquierda (11-15), montaje espejo |
+| 12 | Left Hip Pitch | **inverted** |
+| 13 | Left Knee | **inverted** |
+| 14 | Left Ankle Pitch | **inverted** |
 | 15 | Left Ankle Roll | — |
+
+> Piernas en **bloques secuenciales** (no alternadas): es la única lectura con la que la pose INIT es especularmente simétrica, y está validada numéricamente contra la física de la simulación (V4, `simulation/scripts/replay_motion.py`).
 
 > ⚠️ **Arm axes are asymmetric between sides.** Never assume mirrored values will produce mirrored poses.
 > ⚠️ **Leg values (IDs 6–15) are sacred for gestures.** Gestures only move arm servos (IDs 0–5). Any motion involving legs is `execute_sequence`, not a gesture.

@@ -1,0 +1,348 @@
+<?xml version="1.0"?>
+<robot name="alpha1s" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ================================================================
+       Alpha 1S — URDF v2
+       Origins medidos manualmente desde los ejes reales de los servos
+       ================================================================ -->
+
+  <xacro:property name="mesh_pkg" value="package://alpha1s_bringup/meshes"/>
+  <xacro:property name="effort"   value="2.5"/>
+  <xacro:property name="vel"      value="6.28"/>
+  <xacro:property name="damp"     value="0.05"/>
+  <xacro:property name="fric"     value="0.01"/>
+
+  <!-- ── MACRO: link con malla + inercia ─────────────────────────── -->
+  <xacro:macro name="robot_link" params="name mass ixx iyy izz">
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="${mesh_pkg}/visual/${name}.stl"/>
+        </geometry>
+        <material name="white_plastic">
+          <color rgba="0.95 0.95 0.95 1.0"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="${mesh_pkg}/collision/${name}.stl"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="${mass}"/>
+        <inertia ixx="${ixx}" ixy="0" ixz="0"
+                 iyy="${iyy}" iyz="0" izz="${izz}"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+
+  <!-- ── MACRO: joint revoluto ────────────────────────────────────── -->
+  <xacro:macro name="rev_joint" params="name parent child ox oy oz ax ay az lower upper">
+    <joint name="${name}" type="revolute">
+      <parent link="${parent}"/>
+      <child  link="${child}"/>
+      <origin xyz="${ox} ${oy} ${oz}" rpy="0 0 0"/>
+      <axis   xyz="${ax} ${ay} ${az}"/>
+      <limit  lower="${lower}" upper="${upper}"
+              effort="${effort}" velocity="${vel}"/>
+      <dynamics damping="${damp}" friction="${fric}"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- ================================================================
+       WORLD → BASE
+       ================================================================ -->
+  <link name="world"/>
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 0.28" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================================================================
+       BASE LINK / TORSO
+       ================================================================ -->
+  <xacro:robot_link name="base_link"
+    mass="0.5923" ixx="0.003120" iyy="0.001890" izz="0.002410"/>
+
+  <!-- ================================================================
+       CABEZA
+       offset = Head_global - base_global
+       ================================================================ -->
+  <xacro:robot_link name="Head_link"
+    mass="0.2257" ixx="0.000520" iyy="0.000480" izz="0.000310"/>
+
+  <xacro:rev_joint name="neck_joint"
+    parent="base_link" child="Head_link"
+    ox="-0.000228" oy="-0.009340" oz="0.057200"
+    ax="0" ay="0" az="1"
+    lower="-1.047" upper="1.047"/>
+
+  <!-- ================================================================
+       BRAZO IZQUIERDO
+       ================================================================ -->
+  <xacro:robot_link name="l_shoulder_link"
+    mass="0.0613" ixx="0.000048" iyy="0.000052" izz="0.000031"/>
+
+  <xacro:rev_joint name="l_shoulder_joint"
+    parent="base_link" child="l_shoulder_link"
+    ox="0.055000" oy="-0.011620" oz="0.029880"
+    ax="1" ay="0" az="0"
+    lower="-1.745" upper="1.745"/>
+
+  <xacro:robot_link name="l_arm_link"
+    mass="0.0787" ixx="0.000180" iyy="0.000120" izz="0.000095"/>
+
+  <xacro:rev_joint name="l_arm_joint"
+    parent="l_shoulder_link" child="l_arm_link"
+    ox="0.021170" oy="0.018730" oz="-0.000040"
+    ax="0" ay="1" az="0"
+    lower="-1.571" upper="1.571"/>
+
+  <xacro:robot_link name="l_forearm_link"
+    mass="0.1040" ixx="0.000210" iyy="0.000310" izz="0.000140"/>
+
+  <xacro:rev_joint name="l_elbow_joint"
+    parent="l_arm_link" child="l_forearm_link"
+    ox="0.059180" oy="-0.003730" oz="-0.000390"
+    ax="0" ay="1" az="0"
+    lower="-1.571" upper="1.571"/>
+
+  <!-- ================================================================
+       BRAZO DERECHO (simétrico)
+       ================================================================ -->
+  <xacro:robot_link name="r_shoulder_link"
+    mass="0.0613" ixx="0.000048" iyy="0.000052" izz="0.000031"/>
+
+  <xacro:rev_joint name="r_shoulder_joint"
+    parent="base_link" child="r_shoulder_link"
+    ox="-0.055000" oy="-0.011620" oz="0.029880"
+    ax="1" ay="0" az="0"
+    lower="-1.745" upper="1.745"/>
+
+  <xacro:robot_link name="r_arm_link"
+    mass="0.0787" ixx="0.000180" iyy="0.000120" izz="0.000095"/>
+
+  <xacro:rev_joint name="r_arm_joint"
+    parent="r_shoulder_link" child="r_arm_link"
+    ox="-0.021170" oy="0.018730" oz="-0.000040"
+    ax="0" ay="1" az="0"
+    lower="-1.571" upper="1.571"/>
+
+  <xacro:robot_link name="r_forearm_link"
+    mass="0.1040" ixx="0.000210" iyy="0.000310" izz="0.000140"/>
+
+  <xacro:rev_joint name="r_elbow_joint"
+    parent="r_arm_link" child="r_forearm_link"
+    ox="-0.059180" oy="-0.003730" oz="-0.000390"
+    ax="0" ay="1" az="0"
+    lower="-1.571" upper="1.571"/>
+
+  <!-- ================================================================
+       PIERNA IZQUIERDA
+       ================================================================ -->
+  <xacro:robot_link name="l_hip_roll_link"
+    mass="0.0618" ixx="0.000052" iyy="0.000048" izz="0.000038"/>
+
+  <xacro:rev_joint name="l_hip_roll_joint"
+    parent="base_link" child="l_hip_roll_link"
+    ox="0.026530" oy="-0.018220" oz="-0.045170"
+    ax="0" ay="1" az="0"
+    lower="-1.571" upper="0.524"/>
+
+  <xacro:robot_link name="l_knee_link"
+    mass="0.1035" ixx="0.000310" iyy="0.000850" izz="0.000620"/>
+
+  <xacro:rev_joint name="l_hip_pitch_joint"
+    parent="l_hip_roll_link" child="l_knee_link"
+    ox="-0.013140" oy="0.014840" oz="-0.044380"
+    ax="1" ay="0" az="0"
+    lower="-1.571" upper="1.571"/>
+
+  <xacro:robot_link name="l_ankle_pitch_joint"
+    mass="0.0493" ixx="0.000065" iyy="0.000082" izz="0.000058"/>
+
+  <xacro:rev_joint name="l_knee_joint"
+    parent="l_knee_link" child="l_ankle_pitch_joint"
+    ox="-0.005660" oy="-0.014250" oz="-0.044230"
+    ax="1" ay="0" az="0"
+    lower="-1.325" upper="1.571"/>
+
+  <xacro:robot_link name="l_ankle_link"
+    mass="0.0529" ixx="0.000048" iyy="0.000062" izz="0.000041"/>
+
+  <xacro:rev_joint name="l_ankle_pitch_joint"
+    parent="l_ankle_pitch_joint" child="l_ankle_link"
+    ox="0.001250" oy="0.002250" oz="-0.058450"
+    ax="1" ay="0" az="0"
+    lower="-1.047" upper="1.047"/>
+
+  <xacro:robot_link name="l_foot_link"
+    mass="0.1211" ixx="0.000240" iyy="0.000380" izz="0.000190"/>
+
+  <xacro:rev_joint name="l_ankle_roll_joint"
+    parent="l_ankle_link" child="l_foot_link"
+    ox="0.012350" oy="-0.012880" oz="-0.037490"
+    ax="0" ay="1" az="0"
+    lower="-0.349" upper="1.396"/>
+
+  <!-- ================================================================
+       PIERNA DERECHA (simétrica)
+       ================================================================ -->
+  <xacro:robot_link name="r_hip_roll_link"
+    mass="0.0618" ixx="0.000052" iyy="0.000048" izz="0.000038"/>
+
+  <xacro:rev_joint name="r_hip_roll_joint"
+    parent="base_link" child="r_hip_roll_link"
+    ox="-0.026530" oy="-0.018220" oz="-0.045170"
+    ax="0" ay="1" az="0"
+    lower="-0.524" upper="1.571"/>
+
+  <xacro:robot_link name="r_knee_link"
+    mass="0.1035" ixx="0.000310" iyy="0.000850" izz="0.000620"/>
+
+  <xacro:rev_joint name="r_hip_pitch_joint"
+    parent="r_hip_roll_link" child="r_knee_link"
+    ox="0.013140" oy="0.014840" oz="-0.044380"
+    ax="1" ay="0" az="0"
+    lower="-1.571" upper="1.571"/>
+
+  <xacro:robot_link name="r_ankle_pitch_joint"
+    mass="0.0493" ixx="0.000065" iyy="0.000082" izz="0.000058"/>
+
+  <xacro:rev_joint name="r_knee_joint"
+    parent="r_knee_link" child="r_ankle_pitch_joint"
+    ox="0.005660" oy="-0.014250" oz="-0.044230"
+    ax="1" ay="0" az="0"
+    lower="-1.325" upper="1.571"/>
+
+  <xacro:robot_link name="r_ankle_link"
+    mass="0.0529" ixx="0.000048" iyy="0.000062" izz="0.000041"/>
+
+  <xacro:rev_joint name="r_ankle_pitch_joint"
+    parent="r_ankle_pitch_joint" child="r_ankle_link"
+    ox="-0.001250" oy="0.002250" oz="-0.058450"
+    ax="1" ay="0" az="0"
+    lower="-1.047" upper="1.047"/>
+
+  <xacro:robot_link name="r_foot_link"
+    mass="0.1211" ixx="0.000240" iyy="0.000380" izz="0.000190"/>
+
+  <xacro:rev_joint name="r_ankle_roll_joint"
+    parent="r_ankle_link" child="r_foot_link"
+    ox="-0.012350" oy="-0.012880" oz="-0.037490"
+    ax="0" ay="1" az="0"
+    lower="-1.396" upper="0.349"/>
+
+  <!-- ================================================================
+       GAZEBO — fricción pies
+       ================================================================ -->
+  <gazebo reference="l_foot_link">
+    <mu1>0.90</mu1><mu2>0.80</mu2>
+    <kp>500000.0</kp><kd>10.0</kd>
+    <minDepth>0.001</minDepth>
+  </gazebo>
+  <gazebo reference="r_foot_link">
+    <mu1>0.90</mu1><mu2>0.80</mu2>
+    <kp>500000.0</kp><kd>10.0</kd>
+    <minDepth>0.001</minDepth>
+  </gazebo>
+
+  <!-- ================================================================
+       ros2_control
+       ================================================================ -->
+  <ros2_control name="alpha1s_hardware" type="system">
+    <hardware>
+      <plugin>ign_ros2_control/IgnitionSystem</plugin>
+    </hardware>
+    <joint name="neck_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_shoulder_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_arm_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_elbow_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_shoulder_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_arm_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_elbow_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_hip_roll_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_hip_pitch_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_knee_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_ankle_pitch_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="l_ankle_roll_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_hip_roll_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_hip_pitch_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_knee_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_ankle_pitch_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="r_ankle_roll_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+  </ros2_control>
+
+</robot>
